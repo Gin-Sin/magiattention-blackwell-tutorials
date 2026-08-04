@@ -167,7 +167,7 @@
     function apply() {
       workbench.classList.remove("is-height-synced");
       workbench.style.removeProperty("--workbench-height");
-      if (!window.matchMedia("(min-width: 1500px)").matches) return;
+      if (!window.matchMedia("(min-width: 1800px)").matches) return;
       var unified = pane.offsetHeight;
       if (!isFinite(unified) || unified < 200) return;
       workbench.style.setProperty("--workbench-height", unified + "px");
@@ -349,6 +349,68 @@
     }).join("");
   }
 
+  function initChapterToc(scope) {
+    var toc = scope.querySelector(".chapter-toc");
+    if (!toc) return;
+    var links = Array.prototype.slice.call(toc.querySelectorAll("[data-toc-link]"));
+    var pairs = links.map(function (link) {
+      var id = link.getAttribute("href").slice(1);
+      return { link: link, target: document.getElementById(id) };
+    }).filter(function (pair) {
+      return pair.target;
+    });
+    if (!pairs.length) return;
+
+    function setActive(activeLink) {
+      toc.querySelectorAll(".chapter-toc__item").forEach(function (item) {
+        item.classList.remove("is-ancestor");
+      });
+      links.forEach(function (link) {
+        var active = link === activeLink;
+        link.classList.toggle("is-active", active);
+        if (active) link.setAttribute("aria-current", "location");
+        else link.removeAttribute("aria-current");
+      });
+      var item = activeLink.parentElement;
+      if (item && item.classList.contains("chapter-toc__item--child")) {
+        var ancestor = item.parentElement && item.parentElement.parentElement;
+        if (ancestor) ancestor.classList.add("is-ancestor");
+      }
+    }
+
+    function update() {
+      var marker = window.innerHeight * 0.28;
+      var active = pairs[0].link;
+      pairs.forEach(function (pair) {
+        if (pair.target.getBoundingClientRect().top <= marker) active = pair.link;
+      });
+      if (window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 4) {
+        active = pairs[pairs.length - 1].link;
+      }
+      setActive(active);
+    }
+
+    var pending = 0;
+    function schedule() {
+      if (pending) return;
+      pending = window.requestAnimationFrame(function () {
+        pending = 0;
+        update();
+      });
+    }
+
+    if ("IntersectionObserver" in window) {
+      var observer = new IntersectionObserver(schedule, {
+        rootMargin: "-20% 0px -70% 0px",
+        threshold: [0, 1]
+      });
+      pairs.forEach(function (pair) { observer.observe(pair.target); });
+    }
+    window.addEventListener("scroll", schedule, { passive: true });
+    window.addEventListener("resize", schedule);
+    update();
+  }
+
   function renderChapter() {
     var root = document.getElementById("chapter-root");
     if (!root) return;
@@ -371,20 +433,34 @@
     var tocEntries = [
       ["01", "直觉 Takeaway", "sec-takeaway"],
       ["02", "问题从哪里来", "sec-motivation"],
-      ["03", "架构图与交互源码", "architecture-block"]
+      ["03", "架构图与交互源码", "architecture-block"],
+      ["04", "深入解析", "sec-explain"]
     ];
     (c.explain || []).forEach(function (section, sectionIndex) {
       tocEntries.push([
         "04." + (sectionIndex + 1),
         section.title,
-        "sec-explain-" + sectionIndex
+        "sec-explain-" + sectionIndex,
+        "sec-explain"
       ]);
     });
     tocEntries.push(["05", "练习与答案", "sec-exercises"]);
     tocEntries.push(["06", "参考来源", "sec-sources"]);
-    var toc = '<nav class="chapter-toc" aria-label="本章目录"><span class="chapter-toc__label">Contents · 本章目录</span><ol>' +
-      tocEntries.map(function (entry) {
-        return '<li><a href="#' + entry[2] + '"><i>' + entry[0] + "</i>" + esc(entry[1]) + "</a></li>";
+    var topEntries = tocEntries.filter(function (entry) { return !entry[3]; });
+    var toc = '<nav class="chapter-toc" aria-label="本章目录"><span class="chapter-toc__label">Contents · 本章目录</span>' +
+      '<ol class="chapter-toc__list">' + topEntries.map(function (entry) {
+        var children = tocEntries.filter(function (candidate) {
+          return candidate[3] === entry[2];
+        });
+        return '<li class="chapter-toc__item"><a class="chapter-toc__link" data-toc-link href="#' +
+          entry[2] + '"><i aria-hidden="true">' + entry[0] + '</i><span>' + esc(entry[1]) + "</span></a>" +
+          (children.length
+            ? '<ol class="chapter-toc__sublist">' + children.map(function (child) {
+              return '<li class="chapter-toc__item chapter-toc__item--child"><a class="chapter-toc__link" data-toc-link href="#' +
+                child[2] + '"><i aria-hidden="true">' + child[0] + '</i><span>' +
+                esc(child[1]) + "</span></a></li>";
+            }).join("") + "</ol>"
+            : "") + "</li>";
       }).join("") + "</ol></nav>";
 
     var prev = chapters[index - 1];
@@ -437,6 +513,7 @@
     initWorkbench(root, impl);
     renderMath(root);
     initWorkbenchHeightSync(root);
+    initChapterToc(root);
   }
 
   function populateHome() {

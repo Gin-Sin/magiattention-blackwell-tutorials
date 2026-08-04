@@ -26,7 +26,7 @@ const AUX_KEYS = new Set([
   "attnslice-masktypes", "tmem-map", "pipeline-wave", "mask-segments",
   "correction-handshake", "lpt-swizzle", "bwd-tmem", "overlap-timeline",
   "overlap-timeline-bwd", "cp-communication", "cp-comm-examples",
-  "overlap-degree-schedule"
+  "overlap-degree-schedule", "overlap-degree-causal"
 ]);
 
 for (const chapter of MAGI_CHAPTERS) {

@@ -1228,6 +1228,69 @@
     };
   }
 
+  function auxOverlapDegreeCausal(rootId) {
+    var b = "";
+    var ownerTone = ["orange", "compute", "state", "control"];
+    var SUB = ["₀", "₁", "₂", "₃", "₄", "₅", "₆", "₇"];
+
+    b += panel(40, 52, 1020, 400, "每一拍谁收什么 · causal mask · 连续分片（教学假设）· CP=4 · overlap_degree=3", "orange");
+    b += textLabel(550, 96,
+      "chunk 顺序 c₀ < c₁ < … < c₇，rank r 持有 c₂ᵣ c₂ᵣ₊₁；causal 使 rank r 只依赖更早的 chunk：", 9.8, P.muted, 500);
+    b += textLabel(550, 118,
+      "四个 rank 的远端接收列长分别为 0 / 2 / 4 / 6 块——列长不均是 causal 与 full 的根本差别（颜色 = chunk 属主）。", 9.8, P.muted, 500);
+
+    var cellW = 150;
+    var cellH = 58;
+    var gx0 = 260;
+    var gy0 = 176;
+    /* recvChunks[beat][receiver] = chunk indices received, per the uniform
+       solver's real behavior (host slot in partition 0, idle beats appended). */
+    var recvChunks = [
+      [[], [0], [0], [0, 1]],
+      [[], [1], [1, 2], [2, 3]],
+      [[], [], [3], [4, 5]]
+    ];
+    for (var t = 0; t < 4; t += 1) {
+      b += textLabel(gx0 + t * cellW + (cellW - 12) / 2, gy0 - 16, "rank " + t + " 收", 9.2, P.ink, 600);
+    }
+    for (var r = 0; r < 3; r += 1) {
+      b += textLabel(gx0 - 56, gy0 + r * cellH + (cellH - 12) / 2, "拍 " + r, 9.8, P.ink, 600);
+      for (var c = 0; c < 4; c += 1) {
+        var x = gx0 + c * cellW;
+        var y = gy0 + r * cellH;
+        var chunks = recvChunks[r][c];
+        if (chunks.length === 0) {
+          b += '<rect x="' + x + '" y="' + y + '" width="' + (cellW - 12) + '" height="' + (cellH - 12) +
+            '" rx="7" fill="#f7f7f5" stroke="#d8d8d4" stroke-width="0.9" stroke-dasharray="4 4"/>' +
+            textLabel(x + (cellW - 12) / 2, y + (cellH - 12) / 2, "空拍", 8.8, P.muted, 500);
+        } else {
+          var chipW = 62;
+          var startX = x + ((cellW - 12) - chunks.length * chipW - (chunks.length - 1) * 8) / 2;
+          chunks.forEach(function (idx, k) {
+            var owner = Math.floor(idx / 2);
+            var cx = startX + k * (chipW + 8);
+            b += '<rect x="' + cx + '" y="' + (y + 5) + '" width="' + chipW + '" height="' + (cellH - 22) +
+              '" rx="7" fill="' + toneFill(ownerTone[owner]) +
+              '" stroke="' + toneStroke(ownerTone[owner]) + '" stroke-width="1.1"/>' +
+              textLabel(cx + chipW / 2, y + 5 + (cellH - 22) / 2, "c" + SUB[idx], 9.6, P.ink, owner === 0 ? 700 : 500);
+          });
+        }
+      }
+    }
+    var totals = ["共 0 块", "共 2 块", "共 4 块", "共 6 块"];
+    for (var t2 = 0; t2 < 4; t2 += 1) {
+      b += textLabel(gx0 + t2 * cellW + (cellW - 12) / 2, gy0 + 3 * cellH + 14, totals[t2], 8.8, P.computeStroke, 600);
+    }
+    b += textLabel(550, 396, "group_cast 是集合操作，拍数全局一致：接收列不足 3 段的 rank 用「空拍」补齐（源码 overlap_degree_idle 机制），rank 0 甚至全程空拍；", 9.7, P.muted, 500);
+    b += textLabel(550, 420, "越靠前的 chunk（橙 = c₀ c₁）被越多 rank 需要，rank 3 又收最多又算最多——这正是 dispatch solver 要重新分片抹平的双重偏斜。", 9.7, P.muted, 500);
+
+    return {
+      svg: baseSvg(rootId, "overlap-degree-causal", 470, b,
+        "Per-beat receive schedule for a causal mask with unequal receive columns"),
+      caption: "causal（连续分片教学假设）下的每拍收取表：四个 rank 的远端接收列长 0/2/4/6，uniform 均分后每拍块数不均，不足 degree 段的 rank 以空拍陪跑集合通信。与 full mask 的全对称表对照，可以看到 dispatch solver 重新分片之前 causal 的通信与计算双重偏斜。"
+    };
+  }
+
   function auxCpCommunication(rootId) {
     var b = "";
 
@@ -1293,7 +1356,8 @@
     "overlap-timeline-bwd": auxOverlapTimelineBwd,
     "cp-communication": auxCpCommunication,
     "cp-comm-examples": auxCpCommExamples,
-    "overlap-degree-schedule": auxOverlapDegreeSchedule
+    "overlap-degree-schedule": auxOverlapDegreeSchedule,
+    "overlap-degree-causal": auxOverlapDegreeCausal
   };
 
   var buildSerial = 0;
