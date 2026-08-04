@@ -314,11 +314,25 @@
     }).join("") + "</div>";
   }
 
+  /* A body item may be a plain paragraph string, or an info-card object:
+     { card: true, tone?: "recipe"|"source"|"fact", label?, title?, body: string|string[] } */
+  function renderBodyItem(item) {
+    if (item && typeof item === "object" && item.card) {
+      var cardBody = Array.isArray(item.body) ? item.body : [item.body];
+      return '<aside class="info-card info-card--' + esc(item.tone || "note") + '">' +
+        (item.label ? '<span class="info-card__label">' + esc(item.label) + "</span>" : "") +
+        (item.title ? '<strong class="info-card__title">' + raw(item.title) + "</strong>" : "") +
+        cardBody.map(function (paragraph) {
+          return '<p class="info-card__body">' + raw(paragraph) + "</p>";
+        }).join("") +
+        "</aside>";
+    }
+    return "<p>" + raw(item) + "</p>";
+  }
+
   function renderExplainSections(chapter) {
     return (chapter.explain || []).map(function (section, index) {
-      var body = (section.body || []).map(function (paragraph) {
-        return "<p>" + raw(paragraph) + "</p>";
-      }).join("");
+      var body = (section.body || []).map(renderBodyItem).join("");
       var figure = "";
       if (section.svg && window.MagiDiagrams) {
         var aux = window.MagiDiagrams.buildAux(section.svg);

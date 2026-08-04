@@ -963,15 +963,19 @@
           body: [
             R`<strong>CP（context parallelism，上下文并行）</strong>把长序列的 token 均匀分片，或按计算负载分配到各个 rank；分布式层采用 packed 布局 <code>[num_tokens, num_heads, head_dim]</code>，三个维度依次表示 token 数、注意力头数和单头维度。默认 <strong>KV-comm</strong> 模式让查询张量 Q 常驻，而键/值张量 K/V 移动。不同于固定环形轮转，<code>AttnSlice</code>（注意力切片分析器）根据 mask 依赖生成 <code>CommMeta</code>（通信元数据）；其中 <code>dst_indices[c]</code> 表示 KV 分片 \(c\) 的目标 rank 清单，例如贯穿本章的 rank 2 分片对应 <code>dst_indices[c]=[0,3]</code>，因此每段 KV 只发给真正需要它的 rank。`,
             R`前向中，<code>GroupCast</code>（按目标清单执行的一对多发送）依据 <code>dst_indices</code> 多播每段 K/V；各 rank 再用本地 Q 与收到的远端 K/V 计算 partial attention，产生局部输出 <code>out</code> 和对数归一化项 <code>lse</code>。在 FFA backend 中，<code>out_acc</code> 与 <code>lse_acc</code> 分别是跨 KV stage 累积局部输出和 LSE 的本地缓冲区，因此前向默认不为 out/LSE 发起网络归约。`,
-            R`反向沿同一依赖走对偶路径：正向目标表 <code>dst_indices</code> 对应为反向来源表 <code>src_indices</code>，后者记录每段梯度来自哪些 rank；<code>GroupReduce(reduce_op="sum")</code> 中的 <code>reduce_op</code> 指定求和归约，把各处产生的 K/V 梯度 dK/dV 加回 KV 属主，而 Q 的梯度 dQ 留在 Q 属主本地累加。可选的 <strong><code>qo_comm</code></strong>（Q/O 通信模式）交换角色：<code>GroupCast</code> 将 Q 发往 KV rank，<code>GroupReduce(reduce_op="lse")</code> 用注意力专用的 LSE 归约把 partial out/LSE 合并回 Q 属主。实现中的 <code>cp_group_gc</code> 和 <code>cp_group_gr</code> 分别是 cast 与 reduce 的独立通信组，使两条路径能够重叠。`
+            R`反向沿同一依赖走对偶路径：正向目标表 <code>dst_indices</code> 对应为反向来源表 <code>src_indices</code>，后者记录每段梯度来自哪些 rank；<code>GroupReduce(reduce_op="sum")</code> 中的 <code>reduce_op</code> 指定求和归约，把各处产生的 K/V 梯度 dK/dV 加回 KV 属主，而 Q 的梯度 dQ 留在 Q 属主本地累加。可选的 <strong><code>qo_comm</code></strong>（Q/O 通信模式）交换角色：<code>GroupCast</code> 将 Q 发往 KV rank，<code>GroupReduce(reduce_op="lse")</code> 用注意力专用的 LSE 归约把 partial out/LSE 合并回 Q 属主。实现中的 <code>cp_group_gc</code> 和 <code>cp_group_gr</code> 分别是 cast 与 reduce 的独立通信组，使两条路径能够重叠。`,
+            {
+              card: true,
+              tone: "fact",
+              label: "FACT · 通信量级",
+              title: R`<strong>512 KiB</strong> 的 KV 对 <strong>8 MiB</strong> 的 partial out`,
+              body: [
+                R`取批大小 \(B=1\)、序列长度 \(S=4096\)、\(CP=4\)、Q/KV 头数 \(H_q=16,\ H_{kv}=4\)、单头维度 \(D=128\)。张量采用每元素 2 字节的 bf16，每个 rank 持有 \(S/CP=1024\) 个 token。一个 256-token 的 KV 分片发往一个目标时，K 和 V 各为 <code>[256,4,128]</code>，通信量为 \(2\times256\times4\times128\times2=512\ \mathrm{KiB}\)。`,
+                R`对应的 fp32 partial out 为 <code>[1024,16,128]</code>，每元素 4 字节，占 \(1024\times16\times128\times4=8\ \mathrm{MiB}\)，恰为上述 KV 的 16 倍。默认 KV-comm 因而只让较小的 KV 上网，把较大的 partial out 留在本地合并。`
+              ]
+            }
           ],
-          svg: "cp-communication",
-          formula: R`<p>取 \(B=1,\ S=4096,\ CP=4,\ H_q=16,\ H_{kv}=4,\ D=128\)：\(B\) 是批大小，\(S\) 是序列长度，\(CP\) 是上下文并行 rank 数，\(H_q\) 与 \(H_{kv}\) 分别是 Q 头数和 KV 头数，\(D\) 是单头维度；张量采用每元素 2 字节的 bf16，因此每个 rank 持有 \(S/CP=1024\) 个 token。</p>
-<p>一个 256-token 的 KV 分片发往<strong>一个</strong>目标时，K 和 V 各为 <code>[256,4,128]</code>：</p>
-\[ 2\times256\times4\times128\times2\ \mathrm{bytes}=512\ \mathrm{KiB}. \]
-<p>它对应的 fp32 partial out 为 <code>[1024,16,128]</code>，fp32 每元素 4 字节：</p>
-\[ 1024\times16\times128\times4\ \mathrm{bytes}=8\ \mathrm{MiB}. \]
-<p>因此默认 KV-comm 只让较小的 KV 上网，而把较大的 partial out 留在本地合并。</p>`
+          svg: "cp-communication"
         },
         {
           title: "依赖矩阵的两个端点：full 对称，causal 偏斜",
@@ -998,7 +1002,17 @@
           body: [
             R`<code>overlap_degree</code> 的本义，是把<strong>每个 rank 要接收的远端 KV</strong>按 chunk 粒度切成多少段；chunk 是按 <code>chunk_size</code> 个 token 划分的连续段。切分采用接收方视角，也就是切开通信矩阵中属于本 rank 的远端接收列；每个 stage 对应一轮 <code>group_cast</code> 集合通信和一次 FFA 计算。各接收方的划分投影回发送侧后，才决定发送方每一拍发什么、发给谁，并记录在 <code>CommMeta</code> 的逐 stage 清单中。`,
             R`图中的 full mask 取 \(CP=4\)、<code>overlap_degree=3</code>：每个 rank 的 6 个远端 chunk 被均分成 3 拍，每拍接收 2 个 chunk，错峰置换使每拍每个 rank 单发单收。第 \(i\) 拍先用一轮 <code>group_cast</code> 收取 stage \(i\) 并预取 stage \(i+1\)，随后 FFA 让本地 Q 完整遍历本拍的 KV 子集，得到 partial <code>(out, lse)</code>。这些局部结果经 <code>out_acc/lse_acc</code> 按合并公式跨拍累积，正对应 FlashAttention 在 kernel 内用 \(m/\ell/O\) 递推的分布式重现。整个前向中，每个远端 KV chunk 恰好传输并遍历一次，而本地 Q 会被重读 <code>degree+1</code> 次：一次 host 拍，加上每个远端拍各一次。`,
-            R`取值上，源码默认 <code>degree=1</code>，即本地一段加远端整体一段；<code>degree=0</code> 是内部归一化的阻塞式无重叠模式，先拉取全部 KV 再调用一次 FFA，也可作为不做 LSE 分段合并的校验基线；<code>degree=N≥2</code> 表示静态多段，<code>degree=None</code> 则由 solver 在 <code>dynamic_max_degree</code> 上限内动态搜索。<code>degree</code> 与 \(CP-1\) 没有绑定，图中取 3 只是为了对齐属主边界。每多一拍会增加一次 kernel/通信发射和一轮 a2av 固定延迟；接收缓冲峰值则由预取策略决定：逐段预取的双缓冲约为 \(2\times(\mathrm{全部远端\ KV}/\mathrm{degree})\)，一次性预取全部 stage 时等于全部远端 KV、与 <code>degree</code> 无关。`
+            {
+              card: true,
+              tone: "source",
+              label: "SOURCE · OverlapConfig",
+              title: R`<code>degree</code> 的四种取值与两道切分护栏`,
+              body: [
+                R`源码默认 <code>degree=1</code>，表示本地段加一个远端段；<code>degree=0</code> 是用户侧的阻塞式无重叠写法，初始化时归一化为 <code>degree=1</code>，并把 <code>max_num_chunks</code> 压到 1；<code>degree=N≥2</code> 表示静态 \(N\) 段；<code>degree=None</code> 表示动态搜索，并受 <code>dynamic_max_degree</code> 约束。`,
+                R`默认 <code>min_chunk_size=512</code> 与 <code>max_num_chunks=64</code> 分别限制 chunk 的最小 token 数和最大数量，防止切分过细。阻塞模式将远端 KV 合并后只调用一次 FFA，也避免分段 LSE 合并带来的精度损失。`
+              ]
+            },
+            R`<code>degree</code> 与 \(CP-1\) 没有绑定，图中取 3 只是为了对齐属主边界。每多一拍会增加一次 kernel/通信发射和一轮 a2av 固定延迟。接收缓冲峰值则由预取策略决定：逐段预取的双缓冲约为 \(2\times(\mathrm{全部远端\ KV}/\mathrm{degree})\)，一次性预取全部 stage 时等于全部远端 KV、与 <code>degree</code> 无关。`
           ],
           svg: "overlap-degree-schedule"
         },
@@ -1006,7 +1020,18 @@
           title: "causal 的每一拍：不等长接收列与空拍",
           body: [
             R`<strong>causal 会同时破坏 full 的两种均匀性。</strong>在连续分片的教学假设下，chunk 顺序为 \(c_0<\cdots<c_7\)，rank \(r\) 持有 \(c_{2r},c_{2r+1}\)。当 \(CP=4\) 时，四个 rank 的远端接收列长度依次为 0/2/4/6 个 chunk，这是 rank 之间的第一重不均；同一接收列内，各 chunk 的计算量又随 causal mask 面积而异，越靠前的 chunk 被越多 Q 行依赖。于是 rank 3 不仅接收最多，也承担最多计算。`,
-            R`<code>group_cast</code> 是集合操作，所以 <code>overlap_degree=3</code> 意味着所有 rank 都执行全局一致的 3 拍。图中的 uniform 划分为：rank 1 收 \(c_0/c_1/\varnothing\)，rank 2 收 \(c_0/(c_1c_2)/c_3\)，rank 3 收 \((c_0c_1)/(c_2c_3)/(c_4c_5)\)，rank 0 三拍均为空。源码 <code>_solve_with_uniform</code> 通过 <code>overlap_degree_idle</code> 在 <code>partitions</code> 末尾补空分组；空拍中的 rank 仍照常参与本轮集合通信，只是不接收数据，因而不会破坏其他 rank 的收发次序。`,
+            {
+              card: true,
+              tone: "recipe",
+              label: "RECIPE · 三步口诀",
+              title: R`<strong>列清单 → host 占位均分 → 不够补空拍</strong>`,
+              body: [
+                R`<ol><li><strong>第 1 步 · 列清单：</strong>站在接收方视角，远端 chunk 按 token 顺序排列。causal 连续分片下，rank \(r\) 的清单是 \(c_0,\ldots,c_{2r-1}\)，长度 \(L=2r\)。</li><li><strong>第 2 步 · host 占位 + 均分余数靠前：</strong>清单最前加入 host 占位符，本地计算占第 0 拍一个名额；\(L+1\) 项按有效段数均分，余数从前往后每组多摊 1 项。移除占位符后，每组剩余的远端 chunk 就是该拍所收。</li><li><strong>第 3 步 · 不够补空拍：</strong>\(L<\mathrm{degree}\) 时，有效 degree 为 \(\min(\mathrm{degree},L)\)，缺少的尾拍留空；空拍 rank 仍参与该轮集合通信。</li></ol>`,
+                R`这套切法自然产生四条规律：<strong>拍 0 总是轻一格</strong>，因为它只能依靠 host 计算掩护通信；所有 rank 的清单都从 \(c_0\) 开始，前缀 chunk 因而在拍 0 集中多播，且 causal 下越靠后的 chunk 出场越晚、扇出越小；有效 degree 为 \(\min(\mathrm{degree},L)\)，缺口由空拍补齐；每拍接收块数约为 \((L+1)/\mathrm{degree}\)，可用于估算单拍通信量。`,
+                R`图中 rank 2 的 \(L=4\)：<code>[host,c₀,c₁,c₂,c₃]</code> 共 5 项分 3 组，组大小为 \(2/2/1\)，两个余项靠前分摊；扣除第 0 组中的 host 后，三拍远端块数为 \(1/2/1\)，即 \(c_0/(c_1c_2)/c_3\)。`
+              ]
+            },
+            R`<code>group_cast</code> 是集合操作，所以 <code>overlap_degree=3</code> 意味着所有 rank 都执行全局一致的 3 拍。图中的完整接收表为：rank 0 收 \(\varnothing/\varnothing/\varnothing\)，rank 1 收 \(c_0/c_1/\varnothing\)，rank 2 收 \(c_0/(c_1c_2)/c_3\)，rank 3 收 \((c_0c_1)/(c_2c_3)/(c_4c_5)\)。源码 <code>_solve_with_uniform</code> 通过 <code>overlap_degree_idle</code> 在 <code>partitions</code> 末尾补空分组；空拍中的 rank 仍照常参与本轮集合通信，只是不接收数据，因而不会破坏其他 rank 的收发次序。`,
             R`实际训练的顺序是 <code>dispatch solver</code> 先重新分片，尽量抹平各 rank 的计算量与接收列长度，再由 overlap 策略切拍；因此图中的空拍和双重偏斜是<strong>配平之前</strong>的形态。配平后，列内 chunk 的计算量仍可能不同：uniform 按块数均分只能让每拍通信量接近，greedy 等算法才会按估计耗时做装箱。取值直觉来自 causal 的尺度关系——计算量正比于 mask 面积，通信量正比于边长，长序列下较小的 <code>degree=1~2</code> 往往已经足以隐藏通信；只有通信相对计算变贵时，才更需要较大的 degree。`
           ],
           svg: "overlap-degree-causal"
@@ -1033,7 +1058,18 @@
           title: "OverlapSolver：切几段、每段装什么",
           body: [
             R`明确 degree 与每拍的语义后，<code>OverlapSolver</code> 还要决定候选 degree 和各 stage 的装箱。对候选 chunk \(j\)，\(C_j^{\mathrm{comm}}\) 表示估计通信时间，\(C_j^{\mathrm{calc}}\) 表示估计计算时间；模型假设第 \(i\) 段通信可与第 \(i-1\) 段计算重叠，并据此估算总时延。`,
-            R`当前默认 uniform 算法按块数均分，并把不能整除的余数分散到各拍；它能约束通信量，却未必平衡由 mask 面积决定的计算量，源码也将其定位为可行但非生产级的占位方案。greedy 备选算法则按估计耗时装箱。无论采用哪种算法，<code>min_chunk_size=512</code> 和 <code>max_num_chunks=64</code> 都会限制切分粒度。`,
+            {
+              card: true,
+              tone: "source",
+              label: "SOURCE · _solve_with_uniform",
+              title: R`源码实际切分的是 <code>[host, remote₀, remote₁, …]</code>`,
+              body: [
+                R`<code>stage_costs</code> 的第 0 项是 host 本地计算，后面是按自然顺序排列的远端 chunk。默认 <code>random_costs=false</code>；开启后只先打乱远端项，再把 host 放回清单最前，因此 host 始终位于 <code>partition 0</code> 并占一个名额。`,
+                R`设远端项数为 \(L\)、请求 degree 为 \(d\)。源码先取有效切分段数 \(d_{\mathrm{eff}}=\min(d,L)\)；当 \(L>0\) 时，把 \(L+1\) 个清单项分成 \(d_{\mathrm{eff}}\) 组，每组先取 \(\lfloor(L+1)/d_{\mathrm{eff}}\rfloor\) 项，余下的 \((L+1)\bmod d_{\mathrm{eff}}\) 项从前往后各组多摊 1 项。host 因而固定挤掉第 0 拍的一个远端名额。`,
+                R`当 \(L<d\) 时，<code>overlap_degree_idle=d-L</code> 个空分组追加在 <code>partitions</code> 末尾，使结果仍有全局一致的 \(d\) 拍；\(L=0\) 时只有 host 留在第 0 分组，其余视图全为空拍。源码 docstring 将 uniform 明确称为 “a dummy but feasible solution ... instead of production”；<code>greedy</code> 是按估计耗时装箱的备选算法。`
+              ]
+            },
+            R`host 占位使第 0 拍少装一个远端 chunk，正好对应前文三步口诀中的“拍 0 轻一格”：首拍通信只能由 host 计算遮蔽。uniform 平衡的是清单项数和近似通信量，不保证由 mask 面积决定的计算耗时相等；因此相同 chunk 数的两拍仍可能成为不同长度的关键路径。`,
             R`段太碎会增加 kernel 发射和 a2av 的固定开销；段太粗又难以把首段通信藏进本地计算。因此 solver 不是追求最大的 degree，而是在首段暴露、逐拍重叠、额外发射与缓冲策略之间折中。`
           ],
           formula: R`<p>设远端数据被切成 \(d\) 个 stage，\(P_i\) 是第 \(i\) 个 stage 包含的 chunk 集合；\(C_j^{\mathrm{comm}}\) 和 \(C_j^{\mathrm{calc}}\) 分别是 chunk \(j\) 的估计通信、计算时间；\(C_{\mathrm{host}}^{\mathrm{calc}}\) 是本地 KV 的计算时间。总时延估计为：</p>
@@ -1059,9 +1095,9 @@
         },
         {
           kind: "排程", level: "基础",
-          q: R`连续分片的 causal 教学例中，\(CP=4\)、<code>overlap_degree=3</code>，四个 rank 的远端接收列长为 0/2/4/6 个 chunk。已知非空 partitions 为：rank 1 的 \([c_0],[c_1]\)，rank 2 的 \([c_0],[c_1,c_2],[c_3]\)，rank 3 的 \([c_0,c_1],[c_2,c_3],[c_4,c_5]\)，rank 0 没有远端 chunk。补出四个 rank 的三拍接收表，统计每个 rank 的空拍数，并解释为什么空拍 rank 不能直接跳过该轮 <code>group_cast</code>。`,
-          hint: R`<code>overlap_degree_idle</code> 会在不足三组的 <code>partitions</code> 末尾补空组；集合通信要求所有 rank 以一致的拍数参与。`,
-          answer: R`三拍分别为：rank 0 是 \(\varnothing/\varnothing/\varnothing\)，rank 1 是 \(c_0/c_1/\varnothing\)，rank 2 是 \(c_0/(c_1c_2)/c_3\)，rank 3 是 \((c_0c_1)/(c_2c_3)/(c_4c_5)\)。空拍数依次为 3、1、0、0。<code>group_cast</code> 是集合操作，某一 rank 即使本拍没有接收项，也必须参与同一轮调用以维持全局一致的收发次序；空拍只表示该 rank 不接收数据，不表示整轮通信不存在。这张表描述的是 dispatch solver 重新分片配平之前的形态。`
+          q: R`连续分片的 causal 教学例中，\(CP=4\)、<code>overlap_degree=3</code>，四个 rank 的远端接收列长为 0/2/4/6 个 chunk。已知非空 partitions 为：rank 1 的 \([c_0],[c_1]\)，rank 2 的 \([c_0],[c_1,c_2],[c_3]\)，rank 3 的 \([c_0,c_1],[c_2,c_3],[c_4,c_5]\)，rank 0 没有远端 chunk。补出四个 rank 的三拍接收表，统计每个 rank 的空拍数，解释为什么空拍 rank 不能跳过该轮 <code>group_cast</code>，并用“三步口诀”推导 rank 2 的 \(2/2/1\) 清单分组及 \(1/2/1\) 远端块数。`,
+          hint: R`rank 2 先列出 <code>[host,c₀,c₁,c₂,c₃]</code>；余数靠前分摊。<code>overlap_degree_idle</code> 在不足三组时向末尾补空组。`,
+          answer: R`接收表的三拍分别为：rank 0 是 \(\varnothing/\varnothing/\varnothing\)，rank 1 是 \(c_0/c_1/\varnothing\)，rank 2 是 \(c_0/(c_1c_2)/c_3\)，rank 3 是 \((c_0c_1)/(c_2c_3)/(c_4c_5)\)；空拍数依次为 3、1、0、0。rank 2 的口诀推导是：<strong>第 1 步列清单</strong>，\(L=4\)，远端项为 \(c_0,c_1,c_2,c_3\)；<strong>第 2 步 host 占位并均分</strong>，<code>[host,c₀,c₁,c₂,c₃]</code> 共 5 项分 3 组，\(5=1\times3+2\)，两个余项靠前分摊，所以组大小为 \(2/2/1\)，具体是 <code>[host,c₀]/[c₁,c₂]/[c₃]</code>，扣除 host 后得到 \(1/2/1\) 个远端块；<strong>第 3 步补空拍</strong>，此处 \(L=4\ge3\)，无需补空。对 rank 1，\(L=2<3\)，末尾才补一拍空组。<code>group_cast</code> 是集合操作，空拍 rank 仍须参与同一轮调用以维持全局一致的收发次序；空拍只表示该 rank 不接收数据。这张表描述的是 dispatch solver 重新分片配平之前的形态。`
         },
         {
           kind: "推导", level: "基础",

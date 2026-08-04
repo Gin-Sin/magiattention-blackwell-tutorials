@@ -103,6 +103,68 @@
 .report-figure--aux .diagram-canvas { border: 1px solid var(--rule); border-radius: 14px; overflow: hidden; }
 .report-figure--aux .figcaption { margin: 10px 2px 0; font-size: 12.5px; color: var(--muted); }
 .explain-section .formula { margin-top: 18px; }
+
+/* Info cards: highlight recipes, source facts and numeric examples in prose. */
+.info-card {
+  --card-accent: var(--category);
+  --card-accent-ink: var(--category-ink);
+  --card-accent-soft: var(--category-soft);
+  position: relative;
+  margin: 20px 0;
+  padding: 15px 18px 13px;
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--card-accent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--card-accent-soft) 34%, var(--paper));
+}
+.info-card--recipe {
+  --card-accent: var(--semantic-communication);
+  --card-accent-ink: var(--semantic-communication-ink);
+  --card-accent-soft: var(--semantic-communication-soft);
+}
+.info-card--source {
+  --card-accent: var(--annotation-orange);
+  --card-accent-ink: var(--annotation-orange-ink);
+  --card-accent-soft: var(--annotation-orange-soft);
+}
+.info-card--fact {
+  --card-accent: var(--semantic-compute);
+  --card-accent-ink: var(--semantic-compute-ink);
+  --card-accent-soft: var(--semantic-compute-soft);
+}
+.info-card__label {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--card-accent-ink);
+  font: 500 10px/1.4 var(--mono);
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+.info-card__title {
+  display: block;
+  margin-bottom: 7px;
+  color: var(--ink);
+  font: 600 15px/1.5 var(--serif);
+}
+.info-card__body {
+  margin: 0 0 9px;
+  color: var(--ink-2);
+  font-family: var(--serif);
+  font-size: 15px;
+  line-height: 1.75;
+}
+.info-card__body:last-child { margin-bottom: 0; }
+.info-card__body code { background: color-mix(in srgb, var(--card-accent-soft) 55%, var(--paper)); }
+.info-card ol,
+.info-card ul {
+  margin: 4px 0 9px;
+  padding-left: 22px;
+  color: var(--ink-2);
+  font-family: var(--serif);
+  font-size: 15px;
+  line-height: 1.75;
+}
+.info-card li { margin: 3px 0; }
 .explain-section p code,
 .chapter-main p code,
 .exercise-body code,
