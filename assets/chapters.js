@@ -924,6 +924,125 @@
         { label: "FlashAttention-2 论文 · 附录 B（backward 推导的标准出处）", url: "https://arxiv.org/abs/2307.08691" },
         { label: "MagiAttention 博客 · FA2 数学推导（含 backward 全链）", url: "https://sandai-org.github.io/MagiAttention/docs/blog/fa2_math_derivation/" }
       ]
+    },
+
+    /* ================================================================ *
+     * 08 · Communication–Computation Overlap
+     * ================================================================ */
+    {
+      id: "overlap",
+      order: 8,
+      title: "通算融合",
+      fullTitle: "Communication–Computation Overlap",
+      zhTitle: "通信如何藏进计算的影子里",
+      tag: "分布式 · CP",
+      category: "hybrid",
+      difficulty: "挑战",
+      source: "functional/dist_attn.py · 3806 行",
+      deck: R`前八章的 kernel 无论多快，只解决单卡问题；百万 token 的序列必须切到几十上百个 CP rank 上，而注意力天生要「看见别人的 KV」。本章读 MagiAttention 分布式的心脏 <code>DistAttnRuntime</code>：GroupCast/GroupReduce 两条通信原语、多阶段 overlap 流水线、以及 <code>sm_margin</code> / KernelBarrier 这两种让通信 kernel 与 persistent 计算 kernel 分享 GPU 的方式——第 0 章埋下的每一个伏笔（可合并的 out/lse、sm_margin、GroupReduce）都在这里兑现。`,
+      takeaway: R`通算融合的完整公式是<strong>「切阶段 + 三重奏 + 让 SM」</strong>：把远端 KV 按 overlap solver 的成本模型切成 \(d\) 个 stage；每个时刻让三件事并行——<strong>第 \(i{+}1\) 段的 GroupCast 预取、第 \(i\) 段的 FFA partial attention、第 \(i{-}1\) 段的归约</strong>；而这一切能真正并行的物理前提，是 FFA persistent kernel 通过 <code>sm_margin</code> 给通信 kernel 留出 SM（或 native grpcoll 用 KernelBarrier 保证发射顺序）。归约本身零成本创新：kernel 的 atomic 累加缓冲（<code>out_acc/lse_acc</code>）直接吃掉第 0 章的半群合并公式。`,
+      intuitions: [
+        { label: "原语", title: "GroupCast / GroupReduce", body: R`「一段数据发给多个 rank」与「多段 partial 结果按半群归约到属主」——不规则 mask 的通信不再是 ring，而是按依赖精确投递。` },
+        { label: "流水", title: "三重奏错峰", body: R`prefetch(i+1) ∥ compute(i) ∥ reduce(i−1)：通信藏进计算的影子里,理想情况下端到端时间 = max(通信,计算) 而非两者之和。` },
+        { label: "地皮", title: "SM 是要分的", body: R`NCCL/native 通信 kernel 也要 SM。persistent 的 FFA kernel 少开 sm_margin 个 CTA,通信才有地皮真正并行——overlap 不是免费的时间魔法。` }
+      ],
+      motivation: [
+        R`Ring-Attention 一类环形 CP 方案假设每个 rank 需要「按固定拓扑轮转」所有 KV——对规则的 full/causal mask 尚可,对 Magi-1 的 varlen block-causal 这类<strong>不规则 mask</strong>会产生大量无效通信：很多 (Q,K) 对根本不在 mask 里,却仍要跟着环转一整圈。MagiAttention 的答案与 kernel 侧一脉相承：先用 AttnSlice 把依赖精确化（第 0 章）,dispatch solver 均衡负载后,每个 rank 需要哪些远端 KV 是一张<strong>精确的清单</strong>——通信原语只需按清单投递。这就是 GroupCast（KV 去程）与 GroupReduce（partial 结果回程）。`,
+        R`有了原语还不够：一次性拉全所有远端 KV 再计算,通信完全暴露在关键路径上。<code>DistAttnRuntime</code> 把远端 KV 切成 <code>overlap_degree</code> 个 stage 组成流水线,用异步句柄 <code>WorkWithPostProcessFn</code> 把「等通信」推迟到「真正要用那份数据的前一刻」。切几段、每段装哪些 rank 的数据,由 <code>OverlapSolver</code> 按成本模型求解——这是一个和第 6 章 LPT 同款的「调度问题」,只是排的不是 CTA 而是通信段。`,
+        R`最后一块拼图在 GPU 内部：通信 kernel（NCCL 的 a2av 或 native grpcoll 的收发 kernel）与计算 kernel 抢 SM。若 FFA kernel 占满全部 SM,异步发出的通信会被排队到计算之后——overlap 名存实亡。所以第 0 章见过的 <code>sm_margin</code> 在这里揭晓真身：FFA persistent kernel 故意少开若干 CTA,把 SM 留给通信;而 native grpcoll 路径反其道行之——通信 kernel 常驻 SM,用 <code>KernelBarrier</code> 计数器保证「先发射的计算 kernel 先拿到地皮」,此时 sm_margin 归零。`
+      ],
+      diagram: {
+        key: "overlap",
+        caption: "通算融合全景：meta 层（OverlapSolver 切 stage）→ 前向 overlap 环（prefetch/compute/reduce 三重奏）→ 通信原语层（group_cast 三种实现）→ SM 分配（sm_margin vs KernelBarrier）。点击节点查看对应源码。"
+      },
+      explain: [
+        {
+          title: "GroupCast / GroupReduce：为不规则依赖定制的集合通信",
+          body: [
+            R`两条原语的签名是理解一切的起点（Block 04）。<strong>group_cast</strong>：输入张量按 <code>input_split_sizes</code> 切段,每段带一个目的 rank 列表 <code>dst_indices[i]</code>（可多播）;输出侧 <code>output_split_sizes + src_index</code> 描述收到的段从谁来、按什么顺序排。<strong>group_reduce</strong> 是它的对偶（Block 05）：每段带一个目的 rank（<code>dst_index</code>）,属主侧按 <code>src_indices</code> 把多个来源的同一段<strong>归约</strong>——reduce_op 除了 sum/avg,还有专为注意力设计的 <code>"lse"</code>：用第 0 章的合并公式做 log-sum-exp 加权平均。`,
+            R`默认实现把 group_cast <strong>降解到 NCCL all2all_v</strong>（Block 06）：多播段先在本地复制展开成「每个目的 rank 一份」的连续发送缓冲,a2av 一发;接收侧因为「同源段保序」,只需一次索引重排——这个重排被打包成 <code>post_process_fn</code>,挂在异步句柄上,等待完成后才执行。group_reduce 同理降解：a2av 收齐各来源的 partial 段,post-process 里做本地 sum/lse 归约。代价是显式的 pack/unpack 拷贝与多播复制——这正是 native grpcoll 存在的理由。`,
+            R`<strong>native grpcoll</strong>（DeepEP 风格,Block 04 的第二分支）用 NVLink/RDMA 对称缓冲区直接做多播与归约,省去 pack/unpack,fp32 归约在通信 kernel 内完成（<code>comm_dtype</code> 可低精度传输、高精度累加）;<strong>hierarchical</strong> 分支把「节点内多播」与「跨节点传输」拆成两级 a2av,同一段数据跨节点只走一次 RDMA,到达后再在节点内 NVLink 扇出——三种实现共用一个签名,对上层 <code>DistAttnRuntime</code> 完全透明。`
+          ],
+          formula: R`<p>group_reduce 的 <code>"lse"</code> 归约在通信层复用第 0 章的半群公式：属主收到 \(r\) 个 partial \((out_k, lse_k)\) 后计算</p>
+\[ \mathrm{lse} = \log\!\sum_k e^{\mathrm{lse}_k}, \qquad \mathrm{out} = \sum_k e^{\mathrm{lse}_k - \mathrm{lse}}\, out_k . \]
+<p>交换律 + 结合律意味着：段怎么切、先到后到、在 kernel 里归约还是在通信里归约,结果数学上同一——这是整个多阶段流水线可以任意重排的根本许可。</p>`
+        },
+        {
+          title: "多阶段 overlap 环：prefetch / compute / reduce 三重奏",
+          body: [
+            R`<code>DistAttnFunc.forward</code>（Block 01）是一台精确的三拍机器。<strong>host stage</strong>：先发起 stage-0 的远端 KV 预取,立即用本地 KV 算 partial attention——第一段通信藏在本地计算后面。<strong>主环</strong>第 \(i\) 拍做三件事：① <code>get_curr_q_kv_and_fetch_next</code> 等 stage-\(i\) 的 KV 到位、同时发起 stage-\(i{+}1\) 的预取（Block 02）;② 用 stage-\(i\) 的远端 KV 发射 FFA kernel;③ 把 stage-\(i{-}1\)（FFA 后立即）的 partial 结果交给 <code>reduce_partial_out_lse</code> 异步归约。三类工作分别压在通信流、计算流上,互相只以「异步句柄 + 等待点」耦合。`,
+            R`归约有一个优雅的零通信特例：默认（KV 走通信,Q 不动）模式下,每个 rank 算的都是<strong>自己的 Q</strong> 对不同 KV 段的 partial 结果——它们本来就在本地！FFA backend 直接把上一拍的 \((out, lse)\) 作为 <strong>累加缓冲</strong>（<code>out_acc/lse_acc</code>）传入 kernel（Block 07）：atomic 归约在 kernel 尾声完成合并,连 <code>correct_attn_out_lse</code> 的显式调用都省了。GroupReduce 真正出场是在两处：反向的 dKV 必须回到 KV 属主（sum 归约）,以及开启 qo_comm 时 partial out/lse 回到 Q 属主（lse 归约）。`,
+            R`预取的姿势由 <code>prefetch_stage_by_stage</code> 决定（Block 03）：默认在 host stage 一次把<strong>所有</strong> stage 的 group_cast 全部发出——persistent kernel + sm_margin 保证它们与后续计算并行;但当 <code>CUDA_DEVICE_MAX_CONNECTIONS=1</code>（硬件队列只有一条,先入队者阻塞后来者）或 native grpcoll（缓冲区按 stage 复用,不能同时在飞）时,退化为逐 stage 预取——每拍只提前一步。这是「调度自由度」与「资源占用」的经典折衷。`
+          ],
+          svg: "overlap-timeline"
+        },
+        {
+          title: "OverlapSolver：切几段、每段装什么",
+          body: [
+            R`<code>OverlapConfig.degree</code> 的语义谱系（Block 08）值得背下来：<code>degree=0</code> 完全不 overlap——阻塞式 group_cast 拉全 KV、拼接后<strong>一次</strong> FFA 调用,换来的是彻底绕开 LSE 合并的精度损失（校验用基线）;<code>degree=1</code> 本地 + 1 个远端段（通信只能藏在 host 计算后面）;<code>degree=N</code> 静态多段;<code>degree=None</code> 动态模式——solver 逐个 degree 试解,取总时延最短者。`,
+            R`成本模型（Block 09）把每个候选 chunk 记为 \((C^{\mathrm{comm}}_j, C^{\mathrm{calc}}_j)\)（通信量与 mask 面积各乘一个标定系数）,一个划分方案的总时延按「第 \(i\) 段通信与第 \(i{-}1\) 段计算完美互相掩盖」的假设估算（下方公式）。当前默认解法是朴素的均匀划分（<code>UniformOverlapAlg</code>）,贪心解法留着 TODO——但框架已把「求最优 stage 划分」形式化成了与第 6 章 LPT 同类的 makespan 极小化问题。`,
+            R`划分的粒度下界由 <code>min_chunk_size=512</code>、<code>max_num_chunks=64</code> 控制：段切太碎,每段的 kernel 发射开销与 a2av 固定延迟会吃掉 overlap 的收益;切太粗,首段通信藏不进 host 计算。这组超参与 kernel 侧 tile=128 的角色完全同构——流水线的深度与粒度永远是一对矛盾。`
+          ],
+          formula: R`<p>overlap 划分 \(\{P_0,\dots,P_{d-1}\}\) 的总时延估计（<code>OverlapSolver._calc_overall_cost</code>）：</p>
+\[ T \;=\; \max\!\Big(\textstyle\sum_{j\in P_0} C^{\mathrm{comm}}_j,\; C^{\mathrm{calc}}_{\mathrm{host}}\Big) \;+\; \sum_{i=1}^{d-1}\max\!\Big(\textstyle\sum_{j\in P_i} C^{\mathrm{comm}}_j,\; \sum_{j\in P_{i-1}} C^{\mathrm{calc}}_j\Big) \;+\; \sum_{j\in P_{d-1}} C^{\mathrm{calc}}_j . \]
+<p>每一项都是 \(\max(\text{通信}_i, \text{计算}_{i-1})\)——相邻拍完美互掩的假设。理想的解让每个 \(\max\) 的两个参数相等：通信恰好被计算填满,首段通信恰好被 host 计算填满,只有最后一段计算裸露。这正是「线性可扩展」的数学条件：只要每 rank 的计算量随 CP 度不变（dispatch 均衡）且通信不超过计算,总时延与 CP 度无关。</p>`
+        },
+        {
+          title: "SM 的分配：sm_margin 与 KernelBarrier",
+          body: [
+            R`异步 ≠ 并行。NCCL 的 a2av 也是 GPU kernel,要拿到 SM 才开始搬数据;FFA 是 persistent kernel（第 6 章）,默认按「每 SM 一个 CTA」铺满整卡。若不干预,通信 kernel 只能排在 FFA 之后——nsys 时间线上是「串行的两段」,overlap 完全落空。<code>fwd_sm_margin</code>（Block 03）是解法一：host 侧把 <code>sm_count - margin</code> 传给 tile scheduler,FFA 少开 margin 个 CTA,通信 kernel 从发射起就有地皮,真正与计算并行。margin 大小由环境变量标定——留太多,计算变慢;留太少,通信带宽上不去,是一个按硬件与模型形状实测的旋钮。`,
+            R`native grpcoll 是解法二,哲学相反：通信 kernel 自己常驻 SM（<code>GrpCollConfig.num_sms</code>,默认 24,每 2 个 SM 一条 channel）,反而是<strong>发射顺序</strong>变成新风险——通信 kernel 若先于它依赖的计算 kernel 拿到 SM,会空转占地皮甚至死锁。<code>KernelBarrier</code>（Block 01 开头）是一个 GPU 上的计数器：计算 kernel 尾声 arrive,通信 kernel 开头 spin-wait 到目标值——用微型的「kernel 间 mbarrier」把发射顺序钉死,于是 <code>fwd_sm_margin</code> 返回 0：地皮已由通信 kernel 自带,无需再留。`,
+            R`反向把同样的机器再跑一遍,多两个角色：dKV 的 GroupReduce（sum,回 KV 属主）与 dQ 本地累加,而且尾巴上有一个专门的优化——最后一个 stage 的 dKV 归约没有后续计算可掩,<code>save_tail_stage</code> 把前向存下的末段 KV 让反向「借尸还魂」：调换计算顺序,让末段归约与下一层的反向计算重叠（<code>_hide_tail_stage_reduce_backward</code>）。通算融合的每一处细节都在重复同一句话：<strong>找到还没被占用的影子,把通信塞进去</strong>。`
+          ]
+        }
+      ],
+      warning: R`不要把「overlap_degree 越大越好」当作结论——每加一段就多一次 kernel 发射、一次 a2av 固定延迟、一份 grpcoll 缓冲;当单段通信时间已小于计算时,加段只增开销。也不要混淆两条归约路径：默认 KV-comm 模式下前向的 out/lse 合并<strong>不走网络</strong>（kernel 累加缓冲完成）,GroupReduce 的网络流量在反向 dKV 与 qo_comm 模式——引用「通信量」数据时务必注明模式。`,
+      exercises: [
+        {
+          kind: "概念", level: "基础",
+          q: R`CP=4,rank 2 的某段 KV 同时被 rank 0 和 rank 3 的 Q 需要,而 rank 2 自己的 Q 不需要它。写出这段 KV 在 group_cast 的 <code>dst_indices</code> 中的条目,以及反向时对应 dKV 段在 group_reduce 中的 <code>src_indices</code> 条目。`,
+          hint: R`group_reduce 是 group_cast 的镜像。`,
+          answer: R`前向 group_cast（rank 2 视角）：该段的 <code>dst_indices[i] = [0, 3]</code>——一段数据多播给两个消费者。反向 group_reduce（rank 2 是属主）：该段的 <code>src_indices[i] = [0, 3]</code>——rank 0 和 rank 3 各算出一份 partial dK/dV,按 sum 归约回 rank 2。镜像对称正是「通信按依赖清单精确投递」的体现：不在 mask 里的 (Q,K) 对,一个字节都不会上网络。`
+        },
+        {
+          kind: "推导", level: "基础",
+          q: R`设 host 计算 8ms,三个远端段的（通信,计算）分别为 (6,7)、(5,6)、(4,5) ms。分别计算 degree=3 流水线与「先拉全再算」两种方案的总时延。`,
+          hint: R`套用 _calc_overall_cost 的公式。`,
+          answer: R`流水线：\(T = \max(6,8) + \max(5,7) + \max(4,6) + 5 = 8+7+6+5 = 26\) ms——三段通信全部藏进影子,总时延恰为纯计算 \(8+7+6+5=26\)。先拉全再算：通信 \(6+5+4=15\)（即使三路并发也受带宽约束按串行算）,再计算 \(8+7+6+5=26\),共 41ms。overlap 省下的正是全部 15ms 通信——前提是每段通信都不长于前一段计算。`
+        },
+        {
+          kind: "源码", level: "进阶",
+          q: R`Block 01 的主环里,<code>reduce_partial_out_lse</code> 在默认 KV-comm 模式下并不发起任何通信（Block 07 显示合并已由 kernel 的 out_acc 完成）,但它仍然为每个 stage 压入一个 <code>WorkWithPostProcessFn</code> 并在 <code>prepare_reduced_local_out_lse</code> 里逐个 wait。解释这层「空壳异步」的设计意图。`,
+          hint: R`看 qo_comm 模式下同一个调用点会发生什么。`,
+          answer: R`这是接口的<strong>模式无关性</strong>设计：qo_comm 模式下同一调用点返回真正的 group_reduce 异步句柄（lse 归约在网络上跑）,KV-comm 模式下返回 no-op 句柄（post_process 恒等）。主环代码于是完全不感知模式差异——「每个 stage 交一个归约句柄、结束前统一 wait」的契约恒成立。空壳的代价是几个 Python 对象,换来的是 forward 主环零分支、以及未来加新归约路径（如 native grpcoll 的 fp32 缓冲归约）时不动主环。`
+        },
+        {
+          kind: "系统", level: "进阶",
+          q: R`<code>CUDA_DEVICE_MAX_CONNECTIONS=1</code> 时,为什么「host stage 一次发出全部 prefetch」会几乎杀死 overlap？而留下的例外是「只有最后一个 stage 的 prefetch 还能重叠」——解释这个例外。`,
+          hint: R`想象单条硬件队列里的入队顺序：cast0, cast1, cast2, ffa_host, ffa_0, ...`,
+          answer: R`单 connection 下所有 stream 的工作折叠进一条硬件队列,queue 头部阻塞后续所有条目。一次发全 prefetch 的入队序是 [cast0, cast1, cast2, ffa_host, ...]：ffa_host 要等三个 cast 全部出队才开始——通信不是藏在计算影子里,而是把计算推后,恰好反转。逐 stage 预取的入队序是 [cast0, ffa_host, cast1, ffa_0, cast2, ...]：每个 cast 只挡住它<strong>本来就该等的</strong>下一拍计算的发射点,cast_i 与 ffa_{i-1} 的执行仍然重叠。「最后一个 stage 例外」：cast_{d-1} 之后没有更多 cast 入队,它后面的 ffa 发射不再被新通信阻塞,所以哪怕一次发全,最末段通信仍与它前面的计算天然重叠。`
+        },
+        {
+          kind: "系统", level: "挑战",
+          q: R`sm_margin 的两难：设 FFA 计算在 148 个 SM 上耗时 \(T_c\),通信在带宽不受 SM 数约束时耗时 \(T_m\)。留 margin \(s\) 后计算变为 \(T_c \cdot \frac{148}{148-s}\)（线性模型）。写出端到端时延 \(T(s)\) 并给出最优 margin 的判据;解释为什么 native grpcoll + KernelBarrier 能同时改善这个 trade-off 的两端。`,
+          hint: R`s 太小通信排队（退化为串行）,s 够大才真正并行。`,
+          answer: R`\(s>0\) 且通信 kernel 能被容纳时 \(T(s) = \max\!\big(T_c\frac{148}{148-s},\, T_m(s)\big)\)（\(T_m(s)\) 随 s 增大先降后平——通信自身也需要足够 SM 达到线速）;\(s=0\) 时退化为 \(T_c + T_m\)。最优 s 在两条曲线交点：计算膨胀恰好等于通信耗时。native grpcoll 改善两端：(1) 通信 kernel 是定制的收发/归约 kernel,单 SM 效率高于 NCCL 通用路径,\(T_m(s)\) 曲线整体下移、更小的 s 即达线速;(2) fp32 归约融合进通信 kernel,省掉 NCCL 路径上额外的本地归约 kernel（那也要抢 SM）;KernelBarrier 则消除了「怕通信 kernel 抢跑」而保守多留 margin 的需要——sm_margin 直接归零,计算不再膨胀。`
+        },
+        {
+          kind: "设计", level: "挑战",
+          q: R`MagiAttention 论文声称「线性可扩展」：固定每 rank 序列长度,CP 度翻倍时迭代时间近似不变。用本章的成本模型写出线性可扩展成立的两个充分条件,并各举一个会破坏它的现实场景。`,
+          hint: R`一个条件关于 dispatch,一个关于 comm/calc 之比。`,
+          answer: R`条件一（计算侧）：dispatch solver 使每 rank 的 mask 面积（\(\sum C^{\mathrm{calc}}\)）与 CP 度无关——即负载均衡是完美的。破坏场景：极端不规则 mask 下最重的单个 AttnSlice 超过均值,minheap 也无法切开它（切片粒度下界）,该 rank 成为常驻掉队者。条件二（通信侧）：每个 stage 满足 \(\sum_{j\in P_i} C^{\mathrm{comm}}_j \le \sum_{j\in P_{i-1}} C^{\mathrm{calc}}_j\),即通信永远藏得进计算——由于 causal 类 mask 下计算 \(\propto\) 面积、通信 \(\propto\) 边长,序列越长该不等式越宽松。破坏场景：跨节点带宽骤降（如 RDMA 降级到 TCP）使 \(C^{\mathrm{comm}}\) 乘一个大系数,或 head_dim 很小、mask 很稀疏使单位通信量对应的计算量不足——通信从影子里露出来,scaling 曲线弯折。`
+        }
+      ],
+      sources: [
+        { label: "源码 · functional/dist_attn.py（DistAttnRuntime 与 overlap 主环）", url: "https://github.com/SandAI-org/MagiAttention/blob/main/magi_attention/functional/dist_attn.py" },
+        { label: "源码 · comm/primitive/grpcoll/_group_collective.py（group_cast/group_reduce 三层实现分发）", url: "https://github.com/SandAI-org/MagiAttention/blob/main/magi_attention/comm/primitive/grpcoll/_group_collective.py" },
+        { label: "源码 · meta/solver/overlap_solver.py（OverlapConfig 与成本模型）", url: "https://github.com/SandAI-org/MagiAttention/blob/main/magi_attention/meta/solver/overlap_solver.py" },
+        { label: "MagiAttention 博客 · 主博文（GroupCast/GroupReduce 与 multi-stage overlap 的设计动机）", url: "https://sandai-org.github.io/MagiAttention/docs/blog/magi_attn/" },
+        { label: "MagiAttention 论文 · A Distributed Attention Towards Linear Scalability", url: "https://arxiv.org/abs/2505.13211" },
+        { label: "Ring Attention（对照方案：环形拓扑的通信重叠）", url: "https://arxiv.org/abs/2310.01889" }
+      ]
     }
   ];
 })();

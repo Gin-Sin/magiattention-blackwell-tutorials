@@ -5,10 +5,10 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <meta
       name="description"
-      content="逐特性拆解 MagiAttention 的 Blackwell (SM100) Flex-Flash-Attention 算子：AttnSlice、TMEM、Warp 特化流水线、块级 Mask、Online Softmax、Correction、Tile Scheduler 与反向。"
+      content="逐特性拆解 MagiAttention 的 Blackwell (SM100) Flex-Flash-Attention 算子：AttnSlice、TMEM、Warp 特化流水线、块级 Mask、Online Softmax、Correction、Tile Scheduler、反向与通算融合。"
     />
     <title>FFA on Blackwell · MagiAttention SM100 算子教程</title>
-    <link rel="stylesheet" href="assets/styles.css?v=20260804-1" />
+    <link rel="stylesheet" href="assets/styles.css?v=20260804-2" />
     <link
       rel="stylesheet"
       href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css"
@@ -21,8 +21,9 @@
       defer
       src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
     ></script>
-    <script defer src="assets/chapters.js?v=20260804-1"></script>
-    <script defer src="assets/course.js?v=20260804-1"></script>
+    <script defer src="assets/chapters.js?v=20260804-2"></script>
+    <script defer src="assets/course.js?v=20260804-2"></script>
+    <script defer src="assets/lineage.js?v=20260804-2"></script>
   </head>
   <body>
     <div class="shell">
@@ -41,9 +42,10 @@
           <h1>MagiAttention<em>Blackwell 算子拆解</em></h1>
           <p class="lede">
             以 <strong>magi_attention/kernel/cutedsl/ffa_fwd_sm100.py</strong> 及其配套模块为最高权重信源，
-            把 SM100 上的 Flex-Flash-Attention 拆成 8 个渐进特性：
+            把 SM100 上的 Flex-Flash-Attention 拆成 9 个渐进特性：
             <strong>先看它对外承诺了什么（AttnSlice），再看硬件给了什么（TMEM/UMMA/TMA），
-            最后看 kernel 如何兑现（流水线、Mask、Softmax、Correction、调度、反向）。</strong>
+            再看 kernel 如何兑现（流水线、Mask、Softmax、Correction、调度、反向），
+            最后看通信如何藏进计算的影子（通算融合）。</strong>
           </p>
           <div class="hero-actions">
             <a class="button primary" href="chapter.html?id=attnslice">从 AttnSlice 开始</a>
@@ -61,7 +63,8 @@
           <title id="hero-map-title">FFA Blackwell 算子的三层学习地图</title>
           <desc id="hero-map-desc">
             契约层定义 AttnSlice 语义；硬件层提供 TMEM、UMMA 与 TMA；
-            执行层由流水线、Mask、Softmax、Correction、调度与反向兑现契约。
+            执行层由流水线、Mask、Softmax、Correction、调度与反向兑现契约；
+            通算融合把 kernel 接入分布式 CP 闭环。
           </desc>
           <defs>
             <marker
@@ -136,8 +139,8 @@
             </g>
 
             <g class="hero-map__node hero-map__node--communication">
-              <rect x="156" y="454" width="168" height="40" rx="12" />
-              <text x="240" y="479">MagiAttention CP</text>
+              <rect x="140" y="454" width="200" height="40" rx="12" />
+              <text x="240" y="479">08 通算融合 · CP 闭环</text>
             </g>
           </g>
 
@@ -156,11 +159,11 @@
       </header>
 
       <section class="metric-strip" aria-label="课程统计">
-        <div class="metric"><strong data-chapter-count>8</strong><span>章节 · 每章一个特性</span></div>
-        <div class="metric"><strong data-exercise-count>48</strong><span>练习题 · 附提示与答案</span></div>
-        <div class="metric"><strong>11k+</strong><span>行 CuTe DSL 源码被拆读</span></div>
+        <div class="metric"><strong data-chapter-count>9</strong><span>章节 · 每章一个特性</span></div>
+        <div class="metric"><strong data-exercise-count>54</strong><span>练习题 · 附提示与答案</span></div>
+        <div class="metric"><strong>15k+</strong><span>行 kernel 与分布式源码被拆读</span></div>
         <div class="metric">
-          <strong data-progress-count>0 / 8</strong><span>本地学习进度</span>
+          <strong data-progress-count>0 / 9</strong><span>本地学习进度</span>
         </div>
       </section>
 
@@ -169,19 +172,26 @@
         <header class="section-head">
           <span class="section-no">I</span>
           <div>
-            <h2>一条渐进式的算子脉络</h2>
+            <h2>一张可交互的优化脉络图</h2>
             <p>
-              每一章都是 SM100 FFA kernel 的一个重要特性，且只依赖它之前的章节：
+              每一章都是一个优化点，且只依赖它之前的章节：
               先建立 <strong>AttnSlice = (QRange, KRange, MaskType)</strong> 的语义契约与
               <strong>out/lse 可累加</strong>的输出约定；再认识 Blackwell 的
               <strong>TMEM + tcgen05 UMMA + TMA</strong> 执行基座；然后进入 kernel 本体——
-              load/MMA/softmax/correction/epilogue 的 <strong>warp 特化流水线</strong>，
-              按 slice 收缩的<strong>块级 mask</strong>，驻留 TMEM 的 <strong>online softmax</strong>，
-              跨 warp 的 <strong>correction 与原子归约</strong>，吃满 SM 的
-              <strong>persistent/CLC 调度</strong>；最后用同一套语言读懂 <strong>反向 kernel</strong>。
+              <strong>warp 特化流水线</strong>、<strong>块级 mask</strong>、
+              <strong>online softmax</strong>、<strong>correction 归约</strong>、
+              <strong>persistent/CLC 调度</strong>与<strong>反向 kernel</strong>；
+              最终所有优化点在<strong>通算融合</strong>处汇流——kernel 的可合并输出、
+              persistent 的 SM 让渡、GroupCast/GroupReduce 原语共同撑起分布式 CP。
+              下图把这些因果依赖画成一张图：<strong>悬停</strong>预览一个优化点的上下游链条，
+              <strong>点击</strong>固定并阅读解读。
             </p>
           </div>
         </header>
+        <div class="lineage-board">
+          <figure class="lineage-map" id="lineage-map" aria-label="优化点依赖脉络图"></figure>
+          <aside class="lineage-detail" id="lineage-detail" aria-live="polite"></aside>
+        </div>
       </section>
 
       <section class="section" id="chapters">

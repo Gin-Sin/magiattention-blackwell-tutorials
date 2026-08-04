@@ -2,7 +2,10 @@
 
 面向 GPU 算子/大模型系统工程师的中文教学网站，逐特性拆解
 [MagiAttention](https://github.com/SandAI-org/MagiAttention) 的 Blackwell (SM100)
-Flex-Flash-Attention kernel（`magi_attention/kernel/cutedsl/`，CuTe DSL）。
+Flex-Flash-Attention kernel（`magi_attention/kernel/cutedsl/`，CuTe DSL），
+并以「通算融合」一章接入分布式侧（`functional/dist_attn.py` 与
+`comm/primitive/grpcoll/`）：GroupCast/GroupReduce 原语、多阶段 overlap
+流水线与 sm_margin/KernelBarrier 的 SM 分配。
 
 ## 章节脉络（渐进式）
 
@@ -16,6 +19,7 @@ Flex-Flash-Attention kernel（`magi_attention/kernel/cutedsl/`，CuTe DSL）。
 | 05 | `correction` | Correction / epilogue / LSE | `correction_loop` |
 | 06 | `scheduler` | LPT / L2 swizzle / CLC 调度 | `tile_scheduler.py` |
 | 07 | `backward` | 反向 5-GEMM 与 dQ 原子归约 | `ffa_bwd_sm100.py` 等 |
+| 08 | `overlap` | 通算融合：GroupCast/GroupReduce、多阶段 overlap、sm_margin | `functional/dist_attn.py` `comm/primitive/grpcoll/` `meta/solver/overlap_solver.py` |
 
 每章包含：直觉 takeaway、可点击目录、SVG 架构图 + 交互源码工作台（点击图中节点
 跳转对应源码块，行号对应仓库真实位置并链接 GitHub）、深入解析（含数学推导与
@@ -54,13 +58,14 @@ node tools/validate.mjs
 
 ## 文件结构
 
-- `index.html` — 课程主页：学习地图、统计、章节卡片、来源
+- `index.html` — 课程主页：交互式优化脉络图、统计、章节卡片、来源
 - `chapter.html?id=<id>` — 统一章节渲染页
-- `assets/chapters.js` — 八章教学内容（takeaway/动机/解析/练习/来源）
+- `assets/chapters.js` — 九章教学内容（takeaway/动机/解析/练习/来源）
 - `assets/code.js` — 交互源码块（真实行号 + GitHub 深链）
-- `assets/diagrams.js` — 8 张主架构图 + 7 张辅助示意图（JetBrains Mono、
+- `assets/diagrams.js` — 9 张主架构图 + 8 张辅助示意图（JetBrains Mono、
   KaTeX 公式、内置几何校验）
 - `assets/course.js` — 渲染器：目录、图-码联动工作台、进度
+- `assets/lineage.js` — 首页交互式优化点脉络图（依赖链高亮 + 解读卡片）
 - `assets/styles.css` — editorial 设计系统（配色对齐调度示意图截图风格）
 - `tools/validate.mjs` — 内容与几何校验器
 - `tools/preview.html` — 单图预览harness

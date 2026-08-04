@@ -1936,3 +1936,120 @@ details p { margin-bottom: 0; }
     overflow-wrap: anywhere;
   }
 }
+
+/* ---------------- homepage · interactive optimization lineage ---------------- */
+
+.lineage-board {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: 22px;
+  align-items: start;
+  margin-top: 28px;
+}
+.lineage-map {
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 16px;
+  padding: 18px 14px 10px;
+}
+.lineage-map svg { display: block; width: 100%; height: auto; }
+
+.lineage-edge path {
+  stroke: var(--diagram-edge, #9aa0a6);
+  stroke-width: 1.4;
+  stroke-linecap: square;
+  stroke-linejoin: round;
+  transition: opacity .22s ease, stroke .22s ease, stroke-width .22s ease;
+}
+.lineage-node {
+  cursor: pointer;
+  outline: none;
+  transition: opacity .22s ease;
+}
+.lineage-node rect {
+  stroke-width: 1.35;
+  transition: stroke-width .18s ease, filter .18s ease;
+}
+.lineage-node circle { stroke: none; }
+.lineage-node__no { font-size: 8.5px; font-weight: 700; fill: var(--paper); }
+.lineage-node__title { font-size: 11.5px; font-weight: 600; fill: var(--ink); }
+.lineage-node__sub { font-size: 8.6px; font-weight: 500; fill: var(--ink-2); }
+
+.lineage-node--compute rect { fill: var(--semantic-compute-soft); stroke: var(--semantic-compute); }
+.lineage-node--compute circle { fill: var(--semantic-compute); }
+.lineage-node--dispatch rect { fill: var(--semantic-dispatch-soft); stroke: var(--semantic-dispatch); }
+.lineage-node--dispatch circle { fill: var(--semantic-dispatch); }
+.lineage-node--communication rect { fill: var(--semantic-communication-soft); stroke: var(--semantic-communication); }
+.lineage-node--communication circle { fill: var(--semantic-communication); }
+.lineage-node--remote rect { fill: var(--semantic-remote-soft); stroke: var(--semantic-remote); }
+.lineage-node--remote circle { fill: var(--semantic-remote); }
+.lineage-node--orange rect { fill: var(--annotation-orange-soft, #fbe8cd); stroke: var(--annotation-orange, #c78f4a); }
+.lineage-node--orange circle { fill: var(--annotation-orange, #c78f4a); }
+
+.lineage-node:hover rect,
+.lineage-node:focus-visible rect { stroke-width: 2.2; }
+.lineage-node.is-focus rect {
+  stroke-width: 2.6;
+  filter: drop-shadow(0 3px 10px rgb(46 51 56 / 22%));
+}
+
+svg.has-focus .lineage-node:not(.is-chain) { opacity: .16; }
+svg.has-focus .lineage-edge:not(.is-chain) path { opacity: .1; }
+svg.has-focus .lineage-edge.is-chain path {
+  stroke: var(--graphite);
+  stroke-width: 2.1;
+}
+
+.lineage-legend__swatch { stroke-width: 1.2; }
+.lineage-legend__label { font-size: 9px; fill: var(--ink-2); }
+.lineage-legend__hint { font-size: 9px; fill: var(--ink-2); font-style: italic; }
+
+.lineage-detail {
+  position: sticky;
+  top: 24px;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 16px;
+  padding: 22px 24px 24px;
+  min-height: 320px;
+}
+.lineage-detail__label {
+  display: inline-block;
+  font: 600 10px/1 var(--mono);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--hybrid-ink);
+  margin-bottom: 12px;
+}
+.lineage-detail h3 {
+  margin: 0 0 10px;
+  font: 500 24px/1.2 var(--display);
+  letter-spacing: -.02em;
+}
+.lineage-detail h4 {
+  margin: 18px 0 8px;
+  font: 600 10.5px/1 var(--mono);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+.lineage-detail p { margin: 0 0 10px; font-size: 13.5px; line-height: 1.75; color: var(--ink-2); }
+.lineage-detail__tip { border-top: 1px dashed var(--rule); padding-top: 12px; }
+.lineage-detail__list { list-style: none; margin: 0; padding: 0; }
+.lineage-detail__list li {
+  display: grid;
+  gap: 2px;
+  padding: 8px 0;
+  border-bottom: 1px dashed var(--rule);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.lineage-detail__list li:last-child { border-bottom: 0; }
+.lineage-detail__list strong { font-family: var(--mono); font-size: 11.5px; color: var(--ink); }
+.lineage-detail__list span { color: var(--ink-2); }
+.lineage-detail__go { margin-top: 16px; }
+
+@media (max-width: 1100px) {
+  .lineage-board { grid-template-columns: 1fr; }
+  .lineage-detail { position: static; min-height: 0; }
+}

@@ -670,6 +670,55 @@
     };
   }
 
+  function overlapDiagram(rootId) {
+    var b = "";
+    b += panel(40, 52, 1020, 128, "META · 切阶段（一次求解,整个训练复用）", "control");
+    b += box(70, 84, 290, 66, "OverlapConfig", "degree: 0 / 1 / N / None", "control", 1, "08");
+    b += box(400, 84, 300, 66, "OverlapSolver 成本模型", M("\\textstyle\\sum_i \\max(C^{comm}_i, C^{calc}_{i-1})", "Σ max(comm_i, calc_i-1)"), "control", 2, "09");
+    b += box(740, 84, 280, 66, "CommMeta 投递清单", "每 stage: split_sizes + dst/src", "cyan", 3, "04");
+
+    b += panel(40, 232, 1020, 190, "前向 OVERLAP 环 · DistAttnFunc.forward", "compute");
+    b += box(70, 264, 220, 70, "host: 本地 FFA", "掩护 stage-0 预取", "compute", 4, "01");
+    b += box(330, 264, 250, 70, "wait i · prefetch i+1", "get_curr_q_kv_and_fetch_next", "gather", 5, "02");
+    b += box(620, 264, 200, 70, "FFA stage i", "out_acc/lse_acc 原子累加", "compute", 6, "07");
+    b += box(860, 264, 160, 70, "reduce i", "空壳 或 GroupReduce", "state", 7, "05");
+    b += box(330, 356, 490, 50, "for ith_overlap_stage in range(overlap_degree)", "三件事各睡各的流 · 句柄相连", "compute", null, "01", { dashed: true });
+
+    b += panel(40, 472, 640, 150, "通信原语 · 三层实现", "gather");
+    b += box(70, 508, 250, 70, "group_cast / group_reduce", "hier | native | a2av 分发", "gather", 8, "04");
+    b += box(370, 508, 280, 70, "a2av 降解", "pack → all2all_v → post_process", "gather", 9, "06");
+
+    b += panel(720, 472, 340, 150, "SM 分配", "orange");
+    b += box(750, 508, 280, 70, "sm_margin / KernelBarrier", "留地皮 或 发射顺序钉死", "orange", 10, "03");
+
+    b += edge(rootId, "M360 117H400", null, "control");
+    b += edge(rootId, "M700 117H740", null, "control");
+    b += edge(rootId, "M880 150V200H455V264", [660, 188, "清单交给 runtime", 150], "cyan");
+    b += edge(rootId, "M290 299H330", null, "compute");
+    b += edge(rootId, "M580 299H620", null, "gather");
+    b += edge(rootId, "M820 299H860", null, "compute");
+    b += edge(rootId, "M940 334V381H820", null, "state");
+    b += edge(rootId, "M330 381H305V320H330", [258, 348, "下一拍", 66, 8.2], "compute", true);
+    b += edge(rootId, "M455 334V356", null, "compute");
+    b += edge(rootId, "M430 406V440H195V508", [320, 428, "发起 GroupCast", 130], "gather");
+    b += edge(rootId, "M1000 334V452H250V508", [700, 440, "bwd dKV / qo_comm 走网络", 210], "state");
+    b += edge(rootId, "M820 320H840V466H890V508", [852, 490, "少开 CTA", 80, 8.2], "orange");
+    return {
+      svg: baseSvg(rootId, "overlap", 660, b,
+        "Communication-computation overlap: solver, pipeline loop, comm primitives and SM budget"),
+      title: "通算融合 · 三重奏与它的地基",
+      badges: ["绿 = 求解/配置", "蓝 = 计算", "紫 = 通信原语", "玫瑰 = 归约", "橙 = SM 分配", "青 = 元数据"],
+      notes: [
+        ["先切后跑", "OverlapSolver 按 max(通信ᵢ,计算ᵢ₋₁) 求和的成本模型把远端 KV 切成 stage;CommMeta 固化每 stage 的投递清单,训练全程复用。"],
+        ["三重奏", "主环每拍并行三件事:等第 i 段数据并预取第 i+1 段、用第 i 段算 FFA、把第 i−1 段的 partial 结果交给归约——通信全部藏进计算影子。"],
+        ["归约零成本", "默认 KV-comm 模式下 partial (out,lse) 全在本地:FFA kernel 拿上一拍结果当累加缓冲原子归约,reduce 句柄是空壳;走网络的是反向 dKV 与 qo_comm。"],
+        ["原语三层", "group_cast/group_reduce 一个签名三种实现:NCCL a2av 降解(pack/unpack)、native grpcoll(NVLink/RDMA 常驻 kernel)、hierarchical(跨节点只走一次 RDMA)。"],
+        ["SM 是要分的", "NCCL 路径:FFA persistent kernel 少开 sm_margin 个 CTA 给通信留地皮;native 路径:通信 kernel 自带 SM,KernelBarrier 钉死发射顺序,margin 归零。"]
+      ],
+      memory: "切阶段、三重奏、让地皮——通信藏进计算的影子,只有最后一段计算裸露。"
+    };
+  }
+
   /* ================================================================ *
    * Aux diagrams (illustrative, non-interactive)
    * ================================================================ */
@@ -925,6 +974,45 @@
     };
   }
 
+  function auxOverlapTimeline(rootId) {
+    var b = "";
+    var lanes = [
+      ["GroupCast 通信流", "gather"],
+      ["FFA 计算 (persistent)", "compute"],
+      ["归约 / 句柄", "state"]
+    ];
+    var laneY = {};
+    lanes.forEach(function (lane, i) {
+      var y = 84 + i * 74;
+      laneY[lane[0]] = y;
+      b += textLabel(120, y + 22, lane[0], 10, P.ink, 600);
+      b += '<line x1="215" y1="' + (y + 44) + '" x2="1060" y2="' + (y + 44) +
+        '" stroke="' + P.rule + '" stroke-width="1"/>';
+    });
+    function tile(lane, x, w, label, tone) {
+      var y = laneY[lane];
+      b += '<rect x="' + x + '" y="' + y + '" width="' + w +
+        '" height="44" rx="7" fill="' + toneFill(tone) + '" stroke="' + toneStroke(tone) +
+        '" stroke-width="1.2"/>' + textLabel(x + w / 2, y + 22, label, 9.3, P.ink, 600);
+    }
+    tile("GroupCast 通信流", 230, 150, "cast stage-0", "gather");
+    tile("GroupCast 通信流", 400, 150, "cast stage-1", "gather");
+    tile("GroupCast 通信流", 570, 150, "cast stage-2", "gather");
+    tile("FFA 计算 (persistent)", 230, 150, "host 本地 attn", "compute");
+    tile("FFA 计算 (persistent)", 400, 150, "FFA stage-0", "compute");
+    tile("FFA 计算 (persistent)", 570, 150, "FFA stage-1", "compute");
+    tile("FFA 计算 (persistent)", 740, 150, "FFA stage-2", "compute");
+    tile("归约 / 句柄", 570, 150, "acc(out,lse) S0", "state");
+    tile("归约 / 句柄", 740, 150, "acc S1", "state");
+    tile("归约 / 句柄", 910, 145, "acc S2 · wait 全部", "state");
+    b += textLabel(630, 330, "同一时刻三行并行:cast(i+1) 在通信流上搬数据,FFA(i) 在 SM−margin 个 SM 上算,归约(i−1) 收上一拍。", 10.3, P.muted, 500);
+    b += textLabel(630, 354, "端到端 ≈ Σ max(通信ᵢ, 计算ᵢ₋₁) + 最后一段计算——只有 FFA stage-2 的尾巴是裸露的。", 10.3, P.muted, 500);
+    return {
+      svg: baseSvg(rootId, "overlap-timeline", 380, b, "Multi-stage overlap timeline across comm and compute streams"),
+      caption: "overlap_degree=3 的时间线（示意）：GroupCast、FFA 计算、归约三条泳道错峰推进；通信藏在计算影子里，理想情况下每拍耗时 = max(通信, 计算)。"
+    };
+  }
+
   /* ---------------- registry ---------------- */
 
   var mains = {
@@ -935,7 +1023,8 @@
     softmax: softmaxDiagram,
     correction: correctionDiagram,
     scheduler: schedulerDiagram,
-    backward: backwardDiagram
+    backward: backwardDiagram,
+    overlap: overlapDiagram
   };
 
   var auxes = {
@@ -945,7 +1034,8 @@
     "mask-segments": auxMaskSegments,
     "correction-handshake": auxCorrectionHandshake,
     "lpt-swizzle": auxLptSwizzle,
-    "bwd-tmem": auxBwdTmem
+    "bwd-tmem": auxBwdTmem,
+    "overlap-timeline": auxOverlapTimeline
   };
 
   var buildSerial = 0;

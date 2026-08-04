@@ -2214,6 +2214,599 @@ class ClcState(ParamsBase):
             # … (省略各步的 tiled copy 细节)`
         }
       ]
+    },
+
+    /* ------------------------------------------------------------------ *
+     * Chapter 08 · Communication–computation overlap
+     * ------------------------------------------------------------------ */
+    overlap: {
+      path: "magi_attention/functional/dist_attn.py",
+      blocks: [
+        {
+          id: "01",
+          title: "前向 overlap 主环：prefetch / compute / reduce",
+          start: 3181,
+          end: 3294,
+          code: C`        # init kernel barrier for native grpcoll to ensure comm kernel is always preceded by compute kernel
+        kernel_barrier_fetch = KernelBarrier(
+            dist_attn_runtime.fwd_kernel_barrier_fetch_target
+        )
+        kernel_barrier_reduce = KernelBarrier(
+            dist_attn_runtime.fwd_kernel_barrier_reduce_target
+        )
+
+        # get local qkv and pre-fetch qkv for remote stage(s)
+        local_q, local_kv = dist_attn_runtime.get_curr_q_kv_and_fetch_next(
+            local_q=local_q,
+            local_kv=(local_k, local_v),
+            overlap_stage=None,
+            kernel_barrier=kernel_barrier_fetch,
+        )
+
+        kernel_barrier_fetch.synchronize()
+        (
+            partial_local_out,
+            partial_local_meta,
+        ) = dist_attn_runtime.apply_fwd_partial_attn(
+            q=local_q,
+            kv=local_kv,
+            overlap_stage=None,
+            # …
+        )
+        partial_local_lse = partial_local_meta.lse
+        # …
+
+        # loop into remote stages
+        for ith_overlap_stage in range(dist_attn_runtime.overlap_degree):
+            # … debug logging elided
+
+            # reset kernel barrier for next stage
+            kernel_barrier_fetch.reset()
+
+            # wait for ith remote qkv prepared and pre-fetch (i+1)th remote qkv
+            (
+                curr_remote_q,
+                curr_remote_kv,
+            ) = dist_attn_runtime.get_curr_q_kv_and_fetch_next(
+                local_q=local_q,
+                local_kv=local_kv,
+                overlap_stage=ith_overlap_stage,
+                kernel_barrier=kernel_barrier_fetch,
+            )
+
+            if not dist_attn_runtime.is_last_remote_stage(
+                overlap_stage=ith_overlap_stage
+            ):
+                kernel_barrier_fetch.synchronize()
+
+            if not dist_attn_runtime.is_first_remote_stage(
+                overlap_stage=ith_overlap_stage
+            ):
+                kernel_barrier_reduce.synchronize()
+
+            # apply fwd partial attn with ith remote qkv
+            # overlapped with (i+1)th pre-fetch
+            (
+                partial_remote_out,
+                partial_remote_meta,
+            ) = dist_attn_runtime.apply_fwd_partial_attn(
+                q=curr_remote_q,
+                kv=curr_remote_kv,
+                out_acc=partial_local_out
+                if dist_attn_runtime.fwd_out_lse_use_acc
+                else None,
+                lse_acc=partial_local_lse
+                if dist_attn_runtime.fwd_out_lse_use_acc
+                else None,
+                overlap_stage=ith_overlap_stage,
+                # …
+            )
+            partial_remote_lse = (
+                partial_remote_meta.lse if partial_remote_meta is not None else None
+            )
+            # …
+
+            # reset kernel barrier for next stage
+            kernel_barrier_reduce.reset()
+
+            # reduce ith partial out with partial lse
+            # overlapped with (i+1)th fwd partial attn and maybe (i+2)th pre-fetch
+            dist_attn_runtime.reduce_partial_out_lse(
+                partial_remote_out=partial_remote_out,
+                partial_remote_lse=partial_remote_lse,
+                partial_local_out=partial_local_out,
+                partial_local_lse=partial_local_lse,
+                ref_remote_out=curr_remote_q,
+                overlap_stage=ith_overlap_stage,
+                kernel_barrier=kernel_barrier_reduce,
+            )
+
+        # prepare reduced local out and lse
+        # before returning from forward and saving for backward
+        local_out, local_lse = dist_attn_runtime.prepare_reduced_local_out_lse(
+            partial_local_out=partial_local_out,
+            partial_local_lse=partial_local_lse,
+            ref_local_out=local_q,
+        )`
+        },
+        {
+          id: "02",
+          title: "等当前段 · 发下一段：wait_post_process 与两种预取姿势",
+          start: 367,
+          end: 456,
+          code: C`    def get_curr_q_kv_and_fetch_next(
+        self,
+        local_q: torch.Tensor,
+        local_kv: FusedOrTupleTensor,
+        overlap_stage: int | None = None,
+        kernel_barrier: KernelBarrier | None = None,
+    ) -> tuple[torch.Tensor, FusedOrTupleTensor]:
+        # … docstring elided
+        next_stage = self.get_next_stage(overlap_stage)
+        is_host_stage = self.is_host_stage(overlap_stage)
+        is_last_remote_stage = self.is_last_remote_stage(overlap_stage)
+
+        # wait for host/remote qkv prepared for current stage
+        if is_host_stage:
+            local_q, local_kv = self._maybe_flatten_local_qkv_head_groups(
+                local_q=local_q,
+                local_kv=local_kv,
+            )
+            local_kv = self._maybe_concat(*local_kv, need_concat=self.concat_kv)
+            curr_q, curr_kv = local_q, local_kv
+        else:
+            curr_remote_stage = self.get_curr_remote_stage(overlap_stage)
+            (
+                remote_q_work,
+                remote_q_buffer,
+            ) = self.remote_q_work_with_buffer_per_stage[curr_remote_stage]
+            curr_q = remote_q_work.wait_post_process(remote_q_buffer)
+
+            (
+                remote_kv_work,
+                remote_kv_buffer,
+            ) = self.remote_kv_work_with_buffer_per_stage[curr_remote_stage]
+            curr_kv = remote_kv_work.wait_post_process(remote_kv_buffer)
+
+        # pre-fetch remote qkv for next stage(s)
+        if self.prefetch_stage_by_stage and not is_last_remote_stage:
+            # if using stage-by-stage prefetch, we only pre-fetch the next stage
+            # to avoid blocking the current ffa fwd
+            (
+                self.remote_q_work_with_buffer_per_stage[next_stage]
+            ) = self._fetch_remote_q(
+                local_q=local_q,
+                overlap_stage=next_stage,
+                buffer_name=GrpCollBufferName.GroupCastQO,
+                kernel_barrier=kernel_barrier,
+            )
+            (
+                self.remote_kv_work_with_buffer_per_stage[next_stage]
+            ) = self._fetch_remote_kv(
+                local_kv=local_kv,
+                overlap_stage=next_stage,
+                buffer_name=GrpCollBufferName.GroupCastDefault,
+                kernel_barrier=kernel_barrier,
+            )
+        elif is_host_stage:
+            # when not using stage-by-stage prefetch,
+            # we issue all fetch-remote comms in advance of ffa fwd
+            # and ffa fwd can still overlap with these comms
+            # with the support of non-zero 'sm_margin', thanks to persistent kernel design
+            self.remote_q_work_with_buffer_per_stage = [
+                self._fetch_remote_q(
+                    local_q=local_q,
+                    overlap_stage=ith_stage,
+                    buffer_name=GrpCollBufferName.GroupCastQO,
+                    kernel_barrier=kernel_barrier,
+                )
+                for ith_stage in range(self.overlap_degree)
+            ]
+            self.remote_kv_work_with_buffer_per_stage = [
+                self._fetch_remote_kv(
+                    local_kv=local_kv,
+                    overlap_stage=ith_stage,
+                    buffer_name=GrpCollBufferName.GroupCastDefault,
+                    kernel_barrier=kernel_barrier,
+                )
+                for ith_stage in range(self.overlap_degree)
+            ]
+
+        return curr_q, curr_kv`
+        },
+        {
+          id: "03",
+          title: "prefetch_stage_by_stage 与 fwd_sm_margin",
+          start: 1048,
+          end: 1099,
+          code: C`    @property
+    def prefetch_stage_by_stage(self) -> bool:
+        """
+        NOTE:
+        1. When CUDA_DEVICE_MAX_CONNECTIONS == 1, prefetch must be done stage-by-stage to avoid blocking
+           the FFA forward/backward computation; otherwise only the last stage's prefetch can overlap with
+           computation.
+        2. When native grpcoll is enabled, prefetch must also be done stage-by-stage to avoid blocking
+           the FFA forward/backward computation; otherwise only the last stage's prefetch can overlap with
+           computation (unless allocating many grpcoll buffers, which is very memory intensive because each
+           grpcoll_buffer's memory is managed separately).
+        """
+        return (
+            env.general.is_cuda_device_max_connections_one()
+            or env.comm.is_native_grpcoll_enable()
+        )
+
+    # … kernel_backend / use_native_grpcoll / enable_qo_comm 等属性省略
+
+    @property
+    def fwd_sm_margin(self) -> int:
+        """
+        Get the forward sm_margin reserved for communication.
+
+        1. When native grpcoll is enabled, a kernel barrier guarantees the correct ordering
+           between communication and compute kernels, so no additional sm_margin is required;
+           return 0.
+        2. Otherwise, return the saved sm_margin for communication to allow communication to
+           properly overlap with computation.
+        """
+        if env.comm.is_native_grpcoll_enable():
+            return 0
+        else:
+            return env.comm.ffa_fwd_sm_margin_save_for_comm()`
+        },
+        {
+          id: "04",
+          title: "group_cast：一段发多家 · 三层实现分发",
+          path: "magi_attention/comm/primitive/grpcoll/_group_collective.py",
+          start: 81,
+          end: 205,
+          code: C`def group_cast(
+    input: torch.Tensor,
+    output: torch.Tensor | None,
+    input_split_sizes: list[int] | torch.Tensor,
+    output_split_sizes: list[int] | torch.Tensor,
+    dst_indices: list[list[int]] | torch.Tensor,
+    src_index: list[int] | torch.Tensor,
+    group: dist.ProcessGroup,
+    async_op: bool = False,
+    cast_lse: bool = False,
+    input_lse: torch.Tensor | None = None,
+    output_lse: torch.Tensor | None = None,
+    **kwargs,
+) -> WorkWithPostProcessFn:
+    """Group cast interface
+
+    Args:
+        input (torch.Tensor): input tensor with shape [input_seqlen, ...]
+        # …
+
+        dst_indices (list[list[int]] | torch.Tensor):
+            the 2D destination rank indices list / tensor for each input split to send to,
+            # … 每个输入段一张目的 rank 清单（可多播）
+
+        src_index (list[int] | torch.Tensor):
+            the 1D source rank index list / tensor for each output split to receive from,
+            where len(src_index) == len(output_split_sizes)
+
+            NOTE:
+                1. the order of the output splits are "stable",
+                i.e. the ones from the same source will be in the same order as the input splits
+        # …
+    """
+
+    if env.comm.is_hierarchical_comm_enable():
+        # NOTE: a workaround to reduce inter-comm overhead by hierarchical group-cast
+        return hier_group_cast_impl_with_a2av(
+            # … 节点内 a2av + 跨节点 a2av 两级
+        )
+
+    if env.comm.is_native_grpcoll_enable():
+        # NOTE: a feature under early development
+        return native_group_cast_impl(
+            # … NVLink/RDMA 对称缓冲 · 免 pack/unpack
+        )
+
+    # fall back to the a2a-v implementation
+    return a2av_group_cast_impl(
+        input=input,
+        output=output,
+        input_split_sizes=input_split_sizes,
+        output_split_sizes=output_split_sizes,
+        dst_indices=dst_indices,
+        src_index=src_index,
+        group=group,
+        async_op=async_op,
+        cast_lse=cast_lse,
+        input_lse=input_lse,
+        output_lse=output_lse,
+        **kwargs,
+    )`
+        },
+        {
+          id: "05",
+          title: "group_reduce：多家归一 · \"lse\" 归约语义",
+          path: "magi_attention/comm/primitive/grpcoll/_group_collective.py",
+          start: 255,
+          end: 408,
+          code: C`def group_reduce(
+    input: torch.Tensor,
+    output: torch.Tensor | None,
+    input_split_sizes: list[int] | torch.Tensor,
+    output_split_sizes: list[int] | torch.Tensor,
+    dst_index: list[int] | torch.Tensor,
+    src_indices: list[list[int]] | torch.Tensor,
+    group: dist.ProcessGroup,
+    async_op: bool = False,
+    reduce_op: GroupReduceOp = "sum",
+    acc_reduce: bool = True,
+    comm_dtype: torch.dtype | None = None,
+    input_lse: torch.Tensor | None = None,
+    output_lse: torch.Tensor | None = None,
+    **kwargs,
+) -> WorkWithPostProcessFn:
+    """Group reduce interface
+
+    Args:
+        # …
+        src_indices (list[list[int]] | torch.Tensor):
+            the 2D source rank indices list / tensor for each output split to reduce from,
+
+            NOTE:
+                # …
+                3. since any reduce operation satisfies the commutative property,
+                the order to reduce to the same output split does not matter, except for numerical errors
+
+        reduce_op (GroupReduceOp): the reduce operation to use. Defaults to "sum"
+            - "sum": sum reduction
+            - "avg": average reduction
+            - "lse": log-sum-exp weighted average reduction, with lse correction
+
+            NOTE:
+                if reduce_op is "lse", the user is required to pass "input_lse" and "output_lse",
+                and we only support input/output with shape [seqlen, num_heads, head_dim]
+                while input_lse/output_lse with shape [seqlen, num_heads] for now
+
+        acc_reduce (bool): whether to accumulate the reduction to the given output buffer. Defaults to ''True''.
+        # …
+    """
+
+    if env.comm.is_hierarchical_comm_enable():
+        # NOTE: a workaround to reduce inter-comm overhead by hierarchical group collective
+        # which might be deprecated when the native hierarchical group collective is ready
+        return hier_group_reduce_impl_with_a2av(
+            # …
+        )
+
+    if env.comm.is_native_grpcoll_enable():
+        # NOTE: the new feature under development
+        # which might be the default implementation in the future
+        return native_group_reduce_impl(
+            # … fp32 归约融合进通信 kernel · comm_dtype 可低精传输
+        )
+
+    # fall back to the original a2a-v implementation
+    return a2av_group_reduce_impl(
+        # … a2av 收齐 partial 段 · post_process 里本地 sum/lse 归约
+    )`
+        },
+        {
+          id: "06",
+          title: "a2av 降解：pack → all2all_v → post_process",
+          path: "magi_attention/comm/primitive/grpcoll/_a2av_grpcoll_impl.py",
+          start: 69,
+          end: 179,
+          code: C`def a2av_group_cast_impl(
+    input: torch.Tensor,
+    output: torch.Tensor | None,
+    input_split_sizes: list[int] | torch.Tensor,
+    output_split_sizes: list[int] | torch.Tensor,
+    dst_indices: list[list[int]] | torch.Tensor,
+    src_index: list[int] | torch.Tensor,
+    group: dist.ProcessGroup,
+    async_op: bool = False,
+    cast_lse: bool = False,
+    input_lse: torch.Tensor | None = None,
+    output_lse: torch.Tensor | None = None,
+    **kwargs,
+) -> WorkWithPostProcessFn:
+    """Group-cast implementation based on all2all_v"""
+
+    # ---------    check     --------- #
+    # … 形状与类型断言省略
+
+    # ---------    calc group cast a2a args     --------- #
+
+    (
+        a2a_output,
+        a2a_input,
+        a2a_output_split_size_list,
+        a2a_input_split_size_list,
+        post_process_fn,
+    ) = calc_group_cast_a2a_args(
+        input=input,
+        output=output,
+        input_split_size_list=input_split_sizes,
+        output_split_size_list=output_split_sizes,
+        dst_indices_list=dst_indices,
+        src_index_list=src_index,
+        world_size=dist.get_world_size(group),
+        cast_lse=cast_lse,
+        input_lse=input_lse,
+        output_lse=output_lse,
+        **kwargs,
+    )
+
+    # ---------    lauch a2a comm kernel     --------- #
+
+    if cast_lse:
+        # NOTE: we can not fuse lse comm with out comm based on nccl APIs
+        # due to different shape and dtype
+        # … 两次 all2all_v：out 一次、lse 一次
+        work = [work_out, work_lse]
+    else:
+        work = all2all_v(
+            input=a2a_input,
+            output=a2a_output,
+            input_split_size_list=a2a_input_split_size_list,
+            output_split_size_list=a2a_output_split_size_list,
+            group=group,
+            async_op=async_op,
+        )
+
+    return WorkWithPostProcessFn(
+        work=GeneralWork(work=work),
+        post_process_fn=post_process_fn,
+        async_op=async_op,
+    )`
+        },
+        {
+          id: "07",
+          title: "归约进 kernel：out_acc / lse_acc 与 sm_margin",
+          start: 1300,
+          end: 1336,
+          code: C`            else:
+                partial_out, meta = _flex_flash_attn_forward(
+                    q=q,
+                    k=k,
+                    v=v,
+                    # NOTE: sink token needs to be applied only once
+                    # thus we only apply it at the host stage if not skipped
+                    sink=sink if is_host_stage else None,
+                    sink_layout="sh",
+                    out=out_acc,  # directly reduce to out_acc
+                    lse=lse_acc,  # directly reduce to lse_acc
+                    **attn_arg.to_ffa_args(is_bwd=False),
+                    softmax_scale=softmax_scale,
+                    softcap=softcap,
+                    # NOTE: always use high-precision for the partial out,
+                    # to reduce the error caused by the out/lse correction
+                    out_type=self.hp_dtype,
+                    # NOTE: when using accumulative buffer, we need to always enable atomic reduction
+                    # unless it is the first call when accumulative buffer is still None
+                    disable_fwd_atomic_reduction=(
+                        attn_arg.disable_fwd_atomic_reduction and out_acc is None
+                    ),
+                    deterministic=self.deterministic,
+                    sm_margin=self.fwd_sm_margin,
+                    # optional args below mainly for sparse attn
+                    # …
+                    return_max_logits=return_max_logits,
+                    max_logits=max_logits_acc,  # directly reduce to max_logits_acc
+                )
+
+        return partial_out, meta`
+        },
+        {
+          id: "08",
+          title: "OverlapConfig：degree 的四种语义",
+          path: "magi_attention/meta/solver/overlap_solver.py",
+          start: 71,
+          end: 129,
+          code: C`@dataclass(frozen=True)
+class OverlapConfig:
+    """The config dataclass for multi-stage overlapping.
+
+    The ''degree'' parameter controls both the overlap behavior and the number
+    of remote pipeline stages:
+
+    - ''degree=0'': **no overlap** -- blocking communication + merged attn_arg,
+      completely avoids LSE reduce precision loss.
+    - ''degree=1'': local + 1 remote stage, no multi-stage chunking.
+    - ''degree=N (N>=2)'': local + N remote stages (static multi-stage overlap).
+    - ''degree=None'': dynamic mode -- the overlap solver automatically
+      determines the optimal degree at runtime.
+    """
+
+    mode: AttnOverlapMode = AttnOverlapMode.STATIC
+
+    degree: int | None = 1
+    dynamic_max_degree: int | None = (
+        8  # only used in dynamic mode, if None, then no limit
+    )
+
+    min_chunk_size: int = 512
+    max_num_chunks: int = 64
+
+    # TODO: use another non-trivial alg as default in the future
+    alg: OverlapAlg = UniformOverlapAlg()
+
+    calc_cost_factor: float = (
+        1.0  # define: calc_cost = calc_cost_factor * calc_area (unit: μs)
+    )
+    comm_cost_factor: float = (
+        1.0  # define: comm_cost = comm_cost_factor * comm_size (unit: μs)
+    )
+    # …
+
+    def __post_init__(self):
+        # DEVIATION: degree=0 is normalized to degree=1, max_num_chunks forced to 1
+        # Reason: degree=0 is a user-facing shorthand for "no overlap" (blocking
+        #   comm + merged attn_arg), but pipeline scheduling requires degree>=1.
+        # Recovery: self._no_overlap / self.no_overlap preserves the original intent.
+        object.__setattr__(self, "_no_overlap", self.degree == 0)
+        # … 其余断言省略`
+        },
+        {
+          id: "09",
+          title: "成本模型：max(通信ᵢ, 计算ᵢ₋₁) 求和",
+          path: "magi_attention/meta/solver/overlap_solver.py",
+          start: 381,
+          end: 433,
+          code: C`    def _get_best_solution_from_dict(
+        self,
+        solution_dict: dict[int, OverlapSolution],
+    ) -> OverlapSolution:
+        return sorted(
+            solution_dict.values(),
+            # NOTE: the cmp key is bi-level:
+            # 1. first level: minimize the overall cost (resolution as 1 μs)
+            # 2. if the overall cost is approximately equal,
+            #   then second level: minimize the overlap degree
+            key=lambda sol: (round(sol.overall_cost), sol.overlap_degree),
+        )[0]
+
+    def _calc_overall_cost(
+        self,
+        stage_costs: list[OverlapStageCost],
+        partitions: list[list[int]],
+        overlap_degree: int,
+    ) -> float:
+        # HACK: for now, with the hypothesis that:
+        # every internal comm/calc cost pair can be perfectly overlapped by the larger one
+        # we just calc the overall cost as the sum of two parts:
+        # 1. the sum of the maximum of ith comm cost and (i-1)th calc cost pair, for i in [0,1,...,overlap_degree-1]
+        # 2. the last remote calc cost, with the index of -1
+
+        overall_cost = 0.0
+        for i in range(overlap_degree):
+            if i == 0:
+                # first remote comm cost overlapped with the host calc cost
+                overall_cost += max(
+                    # first remote comm cost
+                    sum(stage_costs[idx].comm_cost for idx in partitions[0]),
+                    # host calc cost
+                    stage_costs[0].calc_cost,
+                )
+            else:  # ith remote comm cost overlapped with (i-1)th remote calc cost
+                overall_cost += max(
+                    # ith remote comm cost
+                    sum(stage_costs[idx].comm_cost for idx in partitions[i]),
+                    # (i-1)th remote calc cost
+                    sum(
+                        stage_costs[idx].calc_cost
+                        for idx in partitions[i - 1]
+                        if idx != 0
+                    ),
+                )
+
+        # last remote calc cost
+        overall_cost += sum(
+            stage_costs[idx].calc_cost for idx in partitions[-1] if idx != 0
+        )
+
+        return overall_cost`
+        }
+      ]
     }
   };
 })();

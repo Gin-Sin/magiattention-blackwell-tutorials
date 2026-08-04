@@ -20,11 +20,11 @@ const { MAGI_CHAPTERS, MAGI_CODE, MagiDiagrams } = context.window;
 const errors = [];
 const check = (cond, msg) => { if (!cond) errors.push(msg); };
 
-check(Array.isArray(MAGI_CHAPTERS) && MAGI_CHAPTERS.length === 8, "expect 8 chapters");
+check(Array.isArray(MAGI_CHAPTERS) && MAGI_CHAPTERS.length === 9, "expect 9 chapters");
 
 const AUX_KEYS = new Set([
   "attnslice-masktypes", "tmem-map", "pipeline-wave", "mask-segments",
-  "correction-handshake", "lpt-swizzle", "bwd-tmem"
+  "correction-handshake", "lpt-swizzle", "bwd-tmem", "overlap-timeline"
 ]);
 
 for (const chapter of MAGI_CHAPTERS) {
