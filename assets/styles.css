@@ -568,17 +568,18 @@ button { font: inherit; }
   position: fixed;
   z-index: 60;
   top: 24px;
-  right: 18px;
-  width: min(300px, calc(100vw - 36px));
+  right: 0;
+  width: min(300px, calc(100vw - 24px));
   max-height: calc(100vh - 48px);
   margin: 0;
   padding: 14px 14px 16px;
   border: 1px solid var(--rule);
-  border-radius: 12px;
+  border-right: none;
+  border-radius: 12px 0 0 12px;
   background: var(--paper);
   overflow: auto;
   overscroll-behavior: contain;
-  box-shadow: 0 12px 34px rgb(48 54 58 / 14%);
+  box-shadow: -10px 8px 30px rgb(48 54 58 / 14%);
   scrollbar-color: var(--rule) transparent;
   scrollbar-width: thin;
   outline: none;
@@ -739,11 +740,9 @@ button { font: inherit; }
 
 @media screen and (min-width: 1360px) {
   .chapter-toc {
-    left: calc(50% + 464px);
-    width: auto;
-    max-width: 240px;
+    width: 252px;
     padding: 14px 12px;
-    box-shadow: 0 12px 34px rgb(48 54 58 / 8%);
+    box-shadow: -10px 8px 30px rgb(48 54 58 / 8%);
   }
   .chapter-toc__label {
     padding: 0 6px;
