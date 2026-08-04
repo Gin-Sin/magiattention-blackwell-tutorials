@@ -1023,6 +1023,15 @@
 <p>每个 \(\max\) 表示同一拍中的通信和计算并行，较慢的一项决定该拍时长。该公式是理想模型：它没有显式计入队列阻塞、固定发射开销和资源竞争，这些因素需要实测校准。</p>`
         },
         {
+          title: "每一拍谁收谁发：同一清单的两种切法",
+          body: [
+            R`<code>overlap_degree</code> 决定全部远端通信被拆成几轮 <code>group_cast</code>，每个 stage 都对应一轮集合通信和一次 FFA 计算。真正被切分的是<strong>每个 rank 要接收的远端 KV</strong>，也就是从接收方看通信矩阵中属于该 rank 的一列，目的是让收取节奏与本 rank 的计算流水对齐。各接收方的 stage 划分投影回发送侧后，才决定发送方每一拍发什么、发给谁，并写入 <code>CommMeta</code> 的逐 stage 清单。`,
+            R`同一份依赖清单可以有多种合法切法，图中 \(CP=4\)、<code>overlap_degree=3</code> 的两种方案总字节数相同，区别只在流水粒度和每拍负载。方案 A 的每拍收取表恰为一个置换，每个 rank 单发单收；KV₀ 依次直达 rank 3、2、1，时间线近似 Ring Attention 的轮转，却不沿环接力。方案 B 则把同一属主的目标集中到一拍：KV₀ 在拍 0 以 <code>dst=[1,2,3]</code> 一次多播；NCCL a2av 路径要按目标打包多份拷贝，发送负载因而偏斜。<code>OverlapSolver</code> 会让每拍的 \(\max(\mathrm{通信},\mathrm{计算})\) 尽量小且均匀，当前默认均匀划分通常更接近方案 A。`,
+            R`逐拍收取还能复用接收缓冲：稳态约只需“正在计算的一块 + 在途的一块”双缓冲；若一次预取全部 stage，full mask 下峰值会升到 \(CP-1\) 块。这与前文“degree 越大，缓冲需求越高”的 warning 一致，也解释了 native grpcoll 复用同一缓冲区时为何只能逐 stage 预取。至于两个端点：<code>degree=0</code> 阻塞式拉全量、完全不重叠，<code>degree=1</code> 把全部远端 KV 放在一段，只能借 host 本地计算掩护。`
+          ],
+          svg: "overlap-degree-schedule"
+        },
+        {
           title: "SM 的分配：sm_margin 与 KernelBarrier",
           body: [
             R`NCCL a2av 也是 GPU kernel。若 persistent（常驻式）FFA 占满所有 SM，通信会等计算结束。前向 SM 预留量 <code>fwd_sm_margin</code> 让 FFA 少启动若干 CTA，给通信保留资源。margin 太大会拖慢计算，太小又不足以支撑通信带宽，因此必须按硬件和形状实测。`,

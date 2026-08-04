@@ -1149,6 +1149,62 @@
     };
   }
 
+  function auxOverlapDegreeSchedule(rootId) {
+    var b = "";
+    var cellW = 90;
+    var cellH = 48;
+
+    function scheduleGrid(x0, y0, recvTable) {
+      var out = "";
+      for (var c = 0; c < 4; c += 1) {
+        out += textLabel(x0 + c * cellW + cellW / 2, y0 - 16, "rank " + c, 9, P.ink, 600);
+      }
+      for (var r = 0; r < 3; r += 1) {
+        out += textLabel(x0 - 44, y0 + r * cellH + cellH / 2, "拍 " + r, 9.5, P.ink, 600);
+        for (var c2 = 0; c2 < 4; c2 += 1) {
+          var kv = recvTable[r][c2];
+          var hot = kv === 0;
+          var x = x0 + c2 * cellW;
+          var y = y0 + r * cellH;
+          out += '<rect x="' + x + '" y="' + y + '" width="' + (cellW - 6) + '" height="' + (cellH - 6) +
+            '" rx="7" fill="' + toneFill(hot ? "orange" : "gather") +
+            '" stroke="' + toneStroke(hot ? "orange" : "gather") + '" stroke-width="1.1"/>' +
+            textLabel(x + cellW / 2 - 3, y + cellH / 2 - 3, "收 KV" + kv, 9.4, P.ink, hot ? 700 : 500);
+        }
+      }
+      return out;
+    }
+
+    b += textLabel(550, 34, "Full mask · CP=4 · overlap_degree=3：每拍一轮 group_cast；单元格 = 该 rank 本拍收到的 KV 段（橙 = KV₀ 的去向）", 10.3, P.muted, 500);
+
+    b += panel(40, 64, 500, 344, "方案 A · 错峰置换（均匀划分）", "control");
+    b += scheduleGrid(160, 150, [
+      [1, 2, 3, 0],
+      [2, 3, 0, 1],
+      [3, 0, 1, 2]
+    ]);
+    b += textLabel(290, 330, "每拍恰为一个置换：每个 rank 单发单收，逐拍负载均匀；", 9.6, P.muted, 500);
+    b += textLabel(290, 352, "KV₀ 依次直达 rank 3→2→1——形似环形轮转，但一步到位、不经接力。", 9.6, P.muted, 500);
+
+    b += panel(560, 64, 500, 344, "方案 B · 属主同拍多播（按属主排序）", "orange");
+    b += scheduleGrid(680, 150, [
+      [1, 0, 0, 0],
+      [2, 2, 1, 1],
+      [3, 3, 3, 2]
+    ]);
+    b += textLabel(810, 330, "同一属主的目标集中到同一拍：拍 0 中 KV₀ 以 dst=[1,2,3] 一次多播；", 9.6, P.muted, 500);
+    b += textLabel(810, 352, "每拍总量仍是 4 段，但单 rank 发送负载偏斜（rank 0 在拍 0 独发 3 份）。", 9.6, P.muted, 500);
+
+    b += textLabel(550, 446,
+      "两种划分的总字节数相同（= 通信矩阵的着色格数）；OverlapSolver 按「每拍 max(通信, 计算) 尽量小且均匀」选择，默认均匀划分接近方案 A。",
+      10.2, P.muted, 500);
+    return {
+      svg: baseSvg(rootId, "overlap-degree-schedule", 478, b,
+        "Two per-stage send/receive schedules under overlap_degree=3 for a full mask"),
+      caption: "overlap_degree=3 把 full mask 的远端通信拆成 3 拍，但「每拍谁发给谁」由各接收方的 stage 划分反推：方案 A 逐拍错峰、单发单收；方案 B 让同一 KV 段在一拍内完成全部多播。总字节数不变，变的是流水粒度与每拍的负载形态。"
+    };
+  }
+
   function auxCpCommunication(rootId) {
     var b = "";
 
@@ -1213,7 +1269,8 @@
     "overlap-timeline": auxOverlapTimeline,
     "overlap-timeline-bwd": auxOverlapTimelineBwd,
     "cp-communication": auxCpCommunication,
-    "cp-comm-examples": auxCpCommExamples
+    "cp-comm-examples": auxCpCommExamples,
+    "overlap-degree-schedule": auxOverlapDegreeSchedule
   };
 
   var buildSerial = 0;
