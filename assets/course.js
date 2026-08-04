@@ -349,9 +349,58 @@
     }).join("");
   }
 
+  var TOC_STORAGE_KEY = "magi_blackwell_toc_collapsed";
+
   function initChapterToc(scope) {
     var toc = scope.querySelector(".chapter-toc");
     if (!toc) return;
+
+    /* Floating panel collapse: panel <-> edge fab. */
+    var fab = scope.querySelector("[data-toc-expand]");
+    var collapseButton = toc.querySelector("[data-toc-collapse]");
+    if (fab && collapseButton) {
+      var readCollapsed = function () {
+        try {
+          return localStorage.getItem(TOC_STORAGE_KEY);
+        } catch (_) {
+          return null;
+        }
+      };
+      var setCollapsed = function (collapsed, persist, moveFocus) {
+        toc.classList.toggle("is-collapsed", collapsed);
+        fab.hidden = !collapsed;
+        if (persist) {
+          try {
+            localStorage.setItem(TOC_STORAGE_KEY, collapsed ? "1" : "0");
+          } catch (_) {
+            /* Storage may be unavailable in privacy mode. */
+          }
+        }
+        if (moveFocus) {
+          try {
+            (collapsed ? fab : toc).focus({ preventScroll: true });
+          } catch (_) {
+            (collapsed ? fab : toc).focus();
+          }
+        }
+      };
+      var stored = readCollapsed();
+      var wide = window.matchMedia("(min-width: 1360px)").matches;
+      setCollapsed(stored == null ? !wide : stored === "1", false, false);
+      collapseButton.addEventListener("click", function () {
+        setCollapsed(true, true, true);
+      });
+      fab.addEventListener("click", function () {
+        setCollapsed(false, true, true);
+      });
+      document.addEventListener("keydown", function (event) {
+        if (event.key !== "Escape") return;
+        if (toc.classList.contains("is-collapsed")) return;
+        if (!toc.contains(document.activeElement)) return;
+        setCollapsed(true, true, true);
+      });
+    }
+
     var links = Array.prototype.slice.call(toc.querySelectorAll("[data-toc-link]"));
     var pairs = links.map(function (link) {
       var id = link.getAttribute("href").slice(1);
@@ -447,7 +496,9 @@
     tocEntries.push(["05", "练习与答案", "sec-exercises"]);
     tocEntries.push(["06", "参考来源", "sec-sources"]);
     var topEntries = tocEntries.filter(function (entry) { return !entry[3]; });
-    var toc = '<nav class="chapter-toc" aria-label="本章目录"><span class="chapter-toc__label">Contents · 本章目录</span>' +
+    var toc = '<nav class="chapter-toc" aria-label="本章目录" tabindex="-1">' +
+      '<div class="chapter-toc__head"><span class="chapter-toc__label">Contents · 本章目录</span>' +
+      '<button class="chapter-toc__toggle" type="button" data-toc-collapse aria-label="折叠目录" title="折叠目录">✕</button></div>' +
       '<ol class="chapter-toc__list">' + topEntries.map(function (entry) {
         var children = tocEntries.filter(function (candidate) {
           return candidate[3] === entry[2];
@@ -461,7 +512,9 @@
                 esc(child[1]) + "</span></a></li>";
             }).join("") + "</ol>"
             : "") + "</li>";
-      }).join("") + "</ol></nav>";
+      }).join("") + "</ol></nav>" +
+      '<button class="chapter-toc-fab" type="button" data-toc-expand aria-label="展开目录" title="展开目录" hidden>' +
+      '<span aria-hidden="true">☰</span><i>目 录</i></button>';
 
     var prev = chapters[index - 1];
     var next = chapters[index + 1];
