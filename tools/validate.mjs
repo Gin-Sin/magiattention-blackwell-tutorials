@@ -25,7 +25,7 @@ check(Array.isArray(MAGI_CHAPTERS) && MAGI_CHAPTERS.length === 9, "expect 9 chap
 const AUX_KEYS = new Set([
   "attnslice-masktypes", "tmem-map", "pipeline-wave", "mask-segments",
   "correction-handshake", "lpt-swizzle", "bwd-tmem", "overlap-timeline",
-  "cp-communication"
+  "overlap-timeline-bwd", "cp-communication", "cp-comm-examples"
 ]);
 
 for (const chapter of MAGI_CHAPTERS) {

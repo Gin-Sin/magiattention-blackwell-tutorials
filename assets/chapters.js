@@ -974,6 +974,15 @@
 <p>因此默认 KV-comm 只让较小的 KV 上网，而把较大的 partial out 留在本地合并。</p>`
         },
         {
+          title: "两个端点：full 的对称与 causal 的偏斜",
+          body: [
+            R`<strong>例 1：full mask。</strong>每个 rank 的 Q 都需要全部 KV，因此每段 KV 的 <code>dst_indices</code> 都包含其余所有 rank；在 \(CP=4\) 时，每个 rank 发出 3 份自己的 KV 拷贝，也收到 3 段远端 KV，单向通信量均为 \((CP-1)/CP\) 份全量 KV。这个总字节数与 Ring Attention 环形轮转 \(CP-1\) 步<strong>完全相同</strong>：GroupCast 在 full mask 下不省字节，差别只在一步直达而非逐跳转发的拓扑，以及更自由的重叠调度。`,
+            R`<strong>例 2：causal mask，按 token 连续均匀分片的教学假设。</strong>rank \(r\) 的 Q 只依赖 rank \(0,\ldots,r\) 的 KV，所以 <code>dst_indices[KV_r] = {r+1,…,CP−1}</code>；\(CP=4\) 时发送份数为 3/2/1/0、接收段数为 0/1/2/3，总通信量恰为 full 的一半。与此同时，计算量正比于 \(r+1\) 所覆盖的下三角面积，形成通信与计算的双重偏斜：rank 0 早早算完干等，rank 3 则又算又收。实际训练中 MagiAttention 不会用这种朴素连续分片运行 causal；<code>dispatch solver</code>（任务派发求解器）会按 chunk 重新分片，尽量抹平各 rank 的 mask 面积，并让 <code>CommMeta</code> 随派发结果更新，这张偏斜矩阵展示的正是它要解决的问题。`,
+            R`反向 dKV 的传输矩阵是前向矩阵的<strong>转置</strong>：谁收过 KV，谁就把 partial dKV 发回其属主，因此 full 仍然对称，而上述 causal 例子变成 rank 0 只收、rank 3 只发。这两个例子构成两个端点；mask 越稀疏、越不规则，矩阵上的“洞”就越多，例如前一小节中 rank 2 的分片只被 rank 0/3 需要，此时 GroupCast 相对固定轮转省下的冗余通信也越多。`
+          ],
+          svg: "cp-comm-examples"
+        },
+        {
           title: "GroupCast / GroupReduce：为不规则依赖定制的集合通信",
           body: [
             R`<strong>group_cast</strong> 先按 <code>input_split_sizes</code> 切段，再用 <code>dst_indices[i]</code> 指定每段要发给哪些 rank。<strong>group_reduce</strong> 做反向操作：把多个来源的对应段送回属主，并按 sum、avg 或注意力专用的 <code>"lse"</code> 规则合并。`,
@@ -994,6 +1003,15 @@
           svg: "overlap-timeline"
         },
         {
+          title: "反向 overlap 环：cast 与 reduce 分道而行",
+          body: [
+            R`反向流水先用本地 KV 完成 host 段反向，并预取远端 stage 0。进入主循环后，第 \(i\) 拍会用 GroupCast 预取下一 stage 的远端 KV，在<strong>单独的 CUDA stream</strong> 上对上一 stage 的 partial dKV 发起 <code>GroupReduce(sum)</code>，再发射当前 stage 的 FFA 反向 kernel。除最后一段 dKV 归约外，这些通信都可被本层反向计算遮蔽。`,
+            R`这里与前向有一个关键区别：默认 KV-comm 的前向 reduce 拍只是空壳句柄，out/LSE 已由 kernel 的 <code>out_acc/lse_acc</code> 在本地合并。反向 reduce 拍则是真正的网络归约，依据 <code>src_indices</code> 镜像清单，把散落在各消费 rank 上的 partial dK/dV 求和送回 KV 属主。dQ 仍在 Q 属主本地累加，不会上网。在 PyTorch 中，一个进程组（process group）对应一条集合通信 CUDA 流；若 cast 与 reduce 共用同一组，两类通信 kernel 就会在同一流上串行，因此实现分别使用 <code>cp_group_gc</code> 承载 GroupCast、<code>cp_group_gr</code> 承载 GroupReduce。`,
+            R`最后一段 dKV 归约之后，本层已经没有计算可以继续遮蔽它，因此这段<strong>尾段归约</strong>会暴露在时间线末端。<code>save_tail_stage</code> 通过调整发射顺序，尝试把尾段归约藏进下一层的反向计算。`
+          ],
+          svg: "overlap-timeline-bwd"
+        },
+        {
           title: "OverlapSolver：切几段、每段装什么",
           body: [
             R`切分度 <code>degree=0</code> 表示先阻塞式拉取全部 KV，再调用一次 FFA，可作为不做 LSE 分段合并的校验基线；<code>degree=1</code> 表示一个远端段；正整数 \(N\) 表示固定切 \(N\) 段；<code>None</code> 让 solver 比较多个 degree。`,
@@ -1009,7 +1027,7 @@
           body: [
             R`NCCL a2av 也是 GPU kernel。若 persistent（常驻式）FFA 占满所有 SM，通信会等计算结束。前向 SM 预留量 <code>fwd_sm_margin</code> 让 FFA 少启动若干 CTA，给通信保留资源。margin 太大会拖慢计算，太小又不足以支撑通信带宽，因此必须按硬件和形状实测。`,
             R`native grpcoll 使用固定数量的常驻通信 SM。此时主要风险变成发射顺序：通信 kernel 不能在依赖的计算尚未完成时占住资源等待。<code>KernelBarrier</code> 用 GPU 计数器协调两类 kernel，因此这条路径不再额外设置 <code>fwd_sm_margin</code>。`,
-            R`反向还需要把 dKV 按 sum 归约回属主。最后一个 stage 没有后续本层计算可用于遮蔽，<code>save_tail_stage</code> 会调整顺序，尝试让这段尾部归约与下一层反向计算重叠。`
+            R`反向中 GroupCast 与 GroupReduce 各占一条通信流，会同时与 FFA 争用 SM，因此 margin 与 <code>KernelBarrier</code> 的资源权衡比前向更紧。两条通信流的流水细节见前文反向 overlap 小节。`
           ]
         }
       ],

@@ -1050,6 +1050,105 @@
     };
   }
 
+  function auxOverlapTimelineBwd(rootId) {
+    var b = "";
+    var lanes = [
+      ["GroupCast 流 · cp_group_gc", "gather"],
+      ["FFA 反向计算 (persistent)", "compute"],
+      ["GroupReduce 流 · cp_group_gr", "state"]
+    ];
+    var laneY = {};
+    lanes.forEach(function (lane, i) {
+      var y = 84 + i * 74;
+      laneY[lane[0]] = y;
+      b += textLabel(120, y + 22, lane[0], 9.2, P.ink, 600);
+      b += '<line x1="215" y1="' + (y + 44) + '" x2="1060" y2="' + (y + 44) +
+        '" stroke="' + P.rule + '" stroke-width="1"/>';
+    });
+    function tile(lane, x, w, label, tone, dashed) {
+      var y = laneY[lane];
+      b += '<rect x="' + x + '" y="' + y + '" width="' + w +
+        '" height="44" rx="7" fill="' + toneFill(tone) + '" stroke="' + toneStroke(tone) +
+        '" stroke-width="1.2" ' + (dashed ? 'stroke-dasharray="6 5" ' : "") + "/>" +
+        textLabel(x + w / 2, y + 22, label, 9.3, P.ink, 600);
+    }
+    tile("GroupCast 流 · cp_group_gc", 230, 150, "cast KV stage-0", "gather");
+    tile("GroupCast 流 · cp_group_gc", 400, 150, "cast KV stage-1", "gather");
+    tile("GroupCast 流 · cp_group_gc", 570, 150, "cast KV stage-2", "gather");
+    tile("FFA 反向计算 (persistent)", 230, 150, "host 本地反向", "compute");
+    tile("FFA 反向计算 (persistent)", 400, 150, "bwd stage-0", "compute");
+    tile("FFA 反向计算 (persistent)", 570, 150, "bwd stage-1", "compute");
+    tile("FFA 反向计算 (persistent)", 740, 150, "bwd stage-2", "compute");
+    tile("FFA 反向计算 (persistent)", 910, 145, "下一层反向…", "compute", true);
+    tile("GroupReduce 流 · cp_group_gr", 570, 150, "reduce dKV S0", "state");
+    tile("GroupReduce 流 · cp_group_gr", 740, 150, "reduce dKV S1", "state");
+    tile("GroupReduce 流 · cp_group_gr", 910, 145, "reduce dKV S2 · 尾段", "orange");
+    b += textLabel(630, 330, "与前向不同,反向的 reduce 拍是真正的网络归约:cast 与 reduce 走两个独立通信组,各占一条通信流,互不串行。", 10.3, P.muted, 500);
+    b += textLabel(630, 354, "尾段 dKV 归约(橙)之后没有本层计算可遮蔽——save_tail_stage 把它推迟到与下一层反向(虚线)重叠。", 10.3, P.muted, 500);
+    return {
+      svg: baseSvg(rootId, "overlap-timeline-bwd", 380, b,
+        "Backward multi-stage overlap timeline with dual communication streams"),
+      caption: "反向 overlap_degree=3 的时间线（示意）：GroupCast 预取下一段 KV、FFA 反向计算当前段、GroupReduce 在独立通信组上归约上一段 partial dKV，三条泳道错峰推进；只有尾段 dKV 归约露在本层之外，由 save_tail_stage 藏进下一层反向。"
+    };
+  }
+
+  function auxCpCommExamples(rootId) {
+    var b = "";
+    var CP = 4;
+    var cell = 50;
+
+    function commMatrix(x0, y0, sendFn, sendCounts, recvCounts) {
+      var out = "";
+      out += textLabel(x0 + CP * cell / 2, y0 - 40, "接收方 →", 9, P.muted, 500);
+      for (var t = 0; t < CP; t += 1) {
+        out += textLabel(x0 + t * cell + cell / 2, y0 - 18, "rank " + t, 9, P.ink, 600);
+      }
+      out += textLabel(x0 - 92, y0 - 18, "KV 属主 ↓", 9, P.muted, 500);
+      for (var r = 0; r < CP; r += 1) {
+        out += textLabel(x0 - 62, y0 + r * cell + cell / 2, "KV" + r + " (rank " + r + ")", 8.6, P.ink, 600);
+        for (var c = 0; c < CP; c += 1) {
+          var x = x0 + c * cell;
+          var y = y0 + r * cell;
+          if (r === c) {
+            out += '<rect x="' + x + '" y="' + y + '" width="' + (cell - 4) + '" height="' + (cell - 4) +
+              '" rx="6" fill="#f0f0ee" stroke="#d8d8d4" stroke-width="0.9"/>' +
+              textLabel(x + cell / 2 - 2, y + cell / 2 - 2, "本地", 8.2, P.muted, 500);
+          } else if (sendFn(r, c)) {
+            out += '<rect x="' + x + '" y="' + y + '" width="' + (cell - 4) + '" height="' + (cell - 4) +
+              '" rx="6" fill="' + toneFill("gather") + '" stroke="' + toneStroke("gather") + '" stroke-width="1.1"/>';
+          } else {
+            out += '<rect x="' + x + '" y="' + y + '" width="' + (cell - 4) + '" height="' + (cell - 4) +
+              '" rx="6" fill="#fbfbf9" stroke="#e2e2de" stroke-width="0.9" stroke-dasharray="3 3"/>';
+          }
+        }
+        out += textLabel(x0 + CP * cell + 32, y0 + r * cell + cell / 2, "发 " + sendCounts[r], 8.8, P.gatherStroke, 600);
+      }
+      for (var c2 = 0; c2 < CP; c2 += 1) {
+        out += textLabel(x0 + c2 * cell + cell / 2, y0 + CP * cell + 16, "收 " + recvCounts[c2], 8.8, P.computeStroke, 600);
+      }
+      return out;
+    }
+
+    b += panel(40, 52, 500, 400, "例 1 · Full mask：全对称", "control");
+    b += commMatrix(210, 150, function (r, c) { return r !== c; }, [3, 3, 3, 3], [3, 3, 3, 3]);
+    b += textLabel(290, 392, "每个 rank 发 3 份、收 3 份，总量 = (CP−1)/CP × 全量 KV，", 9.6, P.muted, 500);
+    b += textLabel(290, 414, "与环形轮转相同——full mask 下按依赖投递没有可省的字节。", 9.6, P.muted, 500);
+
+    b += panel(560, 52, 500, 400, "例 2 · Causal mask：连续分片（教学假设）", "orange");
+    b += commMatrix(730, 150, function (r, c) { return c > r; }, [3, 2, 1, 0], [0, 1, 2, 3]);
+    b += textLabel(810, 392, "只剩上三角：发送随 rank 递减、接收随 rank 递增，通信量减半，", 9.6, P.muted, 500);
+    b += textLabel(810, 414, "但计算量 ∝ rank+1——实际由 dispatch solver 重新分片抹平。", 9.6, P.muted, 500);
+
+    b += textLabel(550, 470,
+      "着色格 = 属主（行）把该段 K/V 发给接收方（列）一份；反向 dKV 的传输矩阵是它的转置：full 依旧对称，causal 变成 rank 0 只收、rank 3 只发。",
+      10, P.muted, 500);
+    return {
+      svg: baseSvg(rootId, "cp-comm-examples", 500, b,
+        "GroupCast communication matrices for full and causal masks at CP=4"),
+      caption: "CP=4 的前向通信矩阵（行 = KV 属主，列 = 接收方）。左：full mask 全对称，每个 rank 发 3 份、收 3 份。右：causal mask 按 token 连续分片时只剩严格上三角——通信量减半但通信与计算都随 rank 偏斜，这正是 dispatch solver 要抹平的形态。"
+    };
+  }
+
   function auxCpCommunication(rootId) {
     var b = "";
 
@@ -1112,7 +1211,9 @@
     "lpt-swizzle": auxLptSwizzle,
     "bwd-tmem": auxBwdTmem,
     "overlap-timeline": auxOverlapTimeline,
-    "cp-communication": auxCpCommunication
+    "overlap-timeline-bwd": auxOverlapTimelineBwd,
+    "cp-communication": auxCpCommunication,
+    "cp-comm-examples": auxCpCommExamples
   };
 
   var buildSerial = 0;
