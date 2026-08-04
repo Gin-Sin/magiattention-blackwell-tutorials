@@ -202,7 +202,7 @@
         esc(item[1]) + "</text>";
       lx += item[1].length * 11 + 66;
     });
-    body += '<text class="lineage-legend__hint" x="1060" y="615" text-anchor="end">悬停预览依赖链 · 点击固定并查看解读</text>';
+    body += '<text class="lineage-legend__hint" x="1060" y="615" text-anchor="end">悬停预览依赖链 · 点击固定解读 · 双击进入章节</text>';
     body += "</g>";
     return (
       '<svg viewBox="0 0 1100 636" role="group" aria-label="优化点依赖脉络图" ' +
@@ -216,7 +216,7 @@
         '<span class="lineage-detail__label">Optimization Lineage · 怎么读</span>' +
         "<h3>先看因果，再进章节</h3>" +
         "<p>每个节点对应一章；每条箭头都读作「因为有 A，B 才成立或才有必要」。</p>" +
-        "<p>悬停节点可预览完整上下游；点击后固定依赖链，并在这里查看解读与章节入口。</p>" +
+        "<p>悬停节点可预览完整上下游；点击固定依赖链并在这里查看解读；双击节点直接进入对应章节。</p>" +
         '<p class="lineage-detail__tip">首次阅读按章节顺序：从 <strong>AttnSlice 契约</strong> 一路走到 <strong>通算融合</strong>，正好穿过全部 9 章。</p>';
       return;
     }
@@ -296,6 +296,11 @@
       el.addEventListener("click", function (event) {
         event.stopPropagation();
         pin(pinned === id ? null : id);
+      });
+      el.addEventListener("dblclick", function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        window.location.href = "chapter.html?id=" + byId[id].chapter;
       });
       el.addEventListener("keydown", function (event) {
         if (event.key !== "Enter" && event.key !== " " && event.key !== "Spacebar") return;

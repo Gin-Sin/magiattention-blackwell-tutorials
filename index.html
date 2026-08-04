@@ -8,7 +8,7 @@
       content="逐特性拆解 MagiAttention 的 Blackwell (SM100) Flex-Flash-Attention 算子：AttnSlice、TMEM、Warp 特化流水线、块级 Mask、Online Softmax、Correction、Tile Scheduler、反向与通算融合。"
     />
     <title>FFA on Blackwell · MagiAttention SM100 算子教程</title>
-    <link rel="stylesheet" href="assets/styles.css?v=20260804-8" />
+    <link rel="stylesheet" href="assets/styles.css?v=20260804-9" />
     <link
       rel="stylesheet"
       href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css"
@@ -23,7 +23,7 @@
     ></script>
     <script defer src="assets/chapters.js?v=20260804-6"></script>
     <script defer src="assets/course.js?v=20260804-6"></script>
-    <script defer src="assets/lineage.js?v=20260804-2"></script>
+    <script defer src="assets/lineage.js?v=20260804-3"></script>
   </head>
   <body>
     <div class="shell">
@@ -176,7 +176,7 @@
             <p>
               这张图将 9 章串成因果主线：从切片契约与硬件基座出发，经流水线、Mask、Softmax、
               Correction、调度和反向，最终汇入通算融合。箭头表示前者让后者成立或变得必要；
-              <strong>悬停</strong>预览上下游，<strong>点击</strong>固定并查看解读。
+              <strong>悬停</strong>预览上下游，<strong>点击</strong>固定并查看解读，<strong>双击</strong>直接进入章节。
             </p>
           </div>
         </header>

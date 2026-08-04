@@ -2184,6 +2184,7 @@ details p { margin-bottom: 0; }
   cursor: pointer;
   outline: none;
   transition: opacity .22s ease;
+  user-select: none;
 }
 .lineage-node rect {
   stroke-width: 1.35;
