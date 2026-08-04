@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>Diagram preview</title>
+    <link rel="stylesheet" href="../assets/styles.css" />
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css"
+    />
+    <script
+      defer
+      src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"
+    ></script>
+    <script
+      defer
+      src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+    ></script>
+    <script defer src="../assets/code.js"></script>
+    <script defer src="../assets/diagrams.js"></script>
+    <style>
+      body { background: #fff; margin: 0; padding: 12px; }
+      .diagram-canvas { max-width: 1280px; border: 1px solid #ddd; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      window.addEventListener("DOMContentLoaded", function () {
+        var params = new URLSearchParams(location.search);
+        var key = params.get("key") || "pipeline";
+        var aux = params.get("aux");
+        var html;
+        if (aux) {
+          html = window.MagiDiagrams.buildAux(aux).svg;
+        } else {
+          html = window.MagiDiagrams.build(key).svg;
+        }
+        document.getElementById("root").innerHTML =
+          '<div class="diagram diagram--report"><div class="diagram-canvas">' + html + "</div></div>";
+        if (window.renderMathInElement) {
+          window.renderMathInElement(document.body, {
+            delimiters: [{ left: "\\(", right: "\\)", display: false }],
+            throwOnError: false
+          });
+        }
+      });
+    </script>
+  </body>
+</html>

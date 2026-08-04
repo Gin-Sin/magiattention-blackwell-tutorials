@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta
+      name="description"
+      content="逐特性拆解 MagiAttention 的 Blackwell (SM100) Flex-Flash-Attention 算子：AttnSlice、TMEM、Warp 特化流水线、块级 Mask、Online Softmax、Correction、Tile Scheduler 与反向。"
+    />
+    <title>FFA on Blackwell · MagiAttention SM100 算子教程</title>
+    <link rel="stylesheet" href="assets/styles.css?v=20260804-1" />
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css"
+    />
+    <script
+      defer
+      src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"
+    ></script>
+    <script
+      defer
+      src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+    ></script>
+    <script defer src="assets/chapters.js?v=20260804-1"></script>
+    <script defer src="assets/course.js?v=20260804-1"></script>
+  </head>
+  <body>
+    <div class="shell">
+      <nav class="topbar" aria-label="主导航">
+        <a class="brand" href="index.html">FFA <span>on Blackwell</span></a>
+        <div class="topnav">
+          <a href="#lineage">学习脉络</a>
+          <a href="#chapters">章节</a>
+          <a href="#sources">来源</a>
+        </div>
+      </nav>
+
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Kernel-first · Source-led</p>
+          <h1>MagiAttention<em>Blackwell 算子拆解</em></h1>
+          <p class="lede">
+            以 <strong>magi_attention/kernel/cutedsl/ffa_fwd_sm100.py</strong> 及其配套模块为最高权重信源，
+            把 SM100 上的 Flex-Flash-Attention 拆成 8 个渐进特性：
+            <strong>先看它对外承诺了什么（AttnSlice），再看硬件给了什么（TMEM/UMMA/TMA），
+            最后看 kernel 如何兑现（流水线、Mask、Softmax、Correction、调度、反向）。</strong>
+          </p>
+          <div class="hero-actions">
+            <a class="button primary" href="chapter.html?id=attnslice">从 AttnSlice 开始</a>
+            <a class="button" href="#lineage">先看全局地图 ↓</a>
+          </div>
+        </div>
+
+        <svg
+          class="hero-map"
+          viewBox="0 0 480 560"
+          role="img"
+          aria-labelledby="hero-map-title hero-map-desc"
+          font-family="JetBrains Mono"
+        >
+          <title id="hero-map-title">FFA Blackwell 算子的三层学习地图</title>
+          <desc id="hero-map-desc">
+            契约层定义 AttnSlice 语义；硬件层提供 TMEM、UMMA 与 TMA；
+            执行层由流水线、Mask、Softmax、Correction、调度与反向兑现契约。
+          </desc>
+          <defs>
+            <marker
+              id="hero-arrow"
+              viewBox="0 0 8 8"
+              markerUnits="userSpaceOnUse"
+              markerWidth="8"
+              markerHeight="8"
+              refX="6.6"
+              refY="4"
+              orient="auto"
+            >
+              <path d="M0 0L8 4L0 8Z" fill="context-stroke" />
+            </marker>
+          </defs>
+          <rect width="480" height="560" rx="18" fill="var(--canvas)" />
+          <text x="24" y="27" font-size="9" fill="var(--graphite)">
+            CONTRACT → HARDWARE → EXECUTION
+          </text>
+
+          <g aria-hidden="true">
+            <path class="hero-map__edge" d="M240 92V122" />
+            <path class="hero-map__edge" d="M240 160V190" />
+            <path class="hero-map__edge" d="M240 228V258H120V288" />
+            <path class="hero-map__edge" d="M240 228V288" />
+            <path class="hero-map__edge" d="M240 228V258H360V288" />
+            <path class="hero-map__edge" d="M120 326V356" />
+            <path class="hero-map__edge" d="M240 326V356" />
+            <path class="hero-map__edge" d="M360 326V356" />
+            <path class="hero-map__edge hero-map__edge--compose" d="M120 394V424H228V454" />
+            <path class="hero-map__edge hero-map__edge--compose" d="M360 394V424H252V454" />
+          </g>
+
+          <g text-anchor="middle">
+            <g class="hero-map__node hero-map__node--compute">
+              <rect x="152" y="54" width="176" height="38" rx="9" />
+              <text x="240" y="78">00 AttnSlice 契约</text>
+            </g>
+            <g class="hero-map__node hero-map__node--dispatch">
+              <rect x="152" y="122" width="176" height="38" rx="9" />
+              <text x="240" y="146">01 TMEM / UMMA / TMA</text>
+            </g>
+            <g class="hero-map__node hero-map__node--communication">
+              <rect x="152" y="190" width="176" height="38" rx="9" />
+              <text x="240" y="214">02 Warp 特化流水线</text>
+            </g>
+
+            <g class="hero-map__node hero-map__node--compute">
+              <rect x="48" y="288" width="144" height="38" rx="9" />
+              <text x="120" y="312">03 块级 Mask</text>
+            </g>
+            <g class="hero-map__node hero-map__node--compute">
+              <rect x="168" y="288" width="144" height="38" rx="9" />
+              <text x="240" y="312">04 Online Softmax</text>
+            </g>
+            <g class="hero-map__node hero-map__node--remote">
+              <rect x="288" y="288" width="144" height="38" rx="9" />
+              <text x="360" y="312">05 Correction</text>
+            </g>
+
+            <g class="hero-map__node hero-map__node--dispatch">
+              <rect x="48" y="356" width="144" height="38" rx="9" />
+              <text x="120" y="380">06 Tile Scheduler</text>
+            </g>
+            <g class="hero-map__node hero-map__node--remote">
+              <rect x="288" y="356" width="144" height="38" rx="9" />
+              <text x="360" y="380">07 反向传播</text>
+            </g>
+            <g class="hero-map__node hero-map__node--communication">
+              <rect x="168" y="356" width="144" height="38" rx="9" />
+              <text x="240" y="380">Fwd 主循环合体</text>
+            </g>
+
+            <g class="hero-map__node hero-map__node--communication">
+              <rect x="156" y="454" width="168" height="40" rx="12" />
+              <text x="240" y="479">MagiAttention CP</text>
+            </g>
+          </g>
+
+          <g aria-label="语义颜色图例">
+            <rect class="hero-map__legend-box" x="20" y="510" width="440" height="34" rx="11" />
+            <rect class="hero-map__swatch--compute" x="34" y="522" width="10" height="10" rx="2" />
+            <text class="hero-map__legend-label" x="50" y="531">契约/计算</text>
+            <rect class="hero-map__swatch--dispatch" x="140" y="522" width="10" height="10" rx="2" />
+            <text class="hero-map__legend-label" x="156" y="531">硬件/调度</text>
+            <rect class="hero-map__swatch--communication" x="252" y="522" width="10" height="10" rx="2" />
+            <text class="hero-map__legend-label" x="268" y="531">流水线</text>
+            <rect class="hero-map__swatch--remote" x="356" y="522" width="10" height="10" rx="2" />
+            <text class="hero-map__legend-label" x="372" y="531">归约/反向</text>
+          </g>
+        </svg>
+      </header>
+
+      <section class="metric-strip" aria-label="课程统计">
+        <div class="metric"><strong data-chapter-count>8</strong><span>章节 · 每章一个特性</span></div>
+        <div class="metric"><strong data-exercise-count>48</strong><span>练习题 · 附提示与答案</span></div>
+        <div class="metric"><strong>11k+</strong><span>行 CuTe DSL 源码被拆读</span></div>
+        <div class="metric">
+          <strong data-progress-count>0 / 8</strong><span>本地学习进度</span>
+        </div>
+      </section>
+
+      <main>
+      <section class="section" id="lineage">
+        <header class="section-head">
+          <span class="section-no">I</span>
+          <div>
+            <h2>一条渐进式的算子脉络</h2>
+            <p>
+              每一章都是 SM100 FFA kernel 的一个重要特性，且只依赖它之前的章节：
+              先建立 <strong>AttnSlice = (QRange, KRange, MaskType)</strong> 的语义契约与
+              <strong>out/lse 可累加</strong>的输出约定；再认识 Blackwell 的
+              <strong>TMEM + tcgen05 UMMA + TMA</strong> 执行基座；然后进入 kernel 本体——
+              load/MMA/softmax/correction/epilogue 的 <strong>warp 特化流水线</strong>，
+              按 slice 收缩的<strong>块级 mask</strong>，驻留 TMEM 的 <strong>online softmax</strong>，
+              跨 warp 的 <strong>correction 与原子归约</strong>，吃满 SM 的
+              <strong>persistent/CLC 调度</strong>；最后用同一套语言读懂 <strong>反向 kernel</strong>。
+            </p>
+          </div>
+        </header>
+      </section>
+
+      <section class="section" id="chapters">
+        <header class="section-head">
+          <span class="section-no">II</span>
+          <div>
+            <h2>章节</h2>
+            <p>
+              每章包含：直觉 takeaway、可点击目录、SVG 架构图 + 交互源码工作台
+              （代码忠于 <code>magi_attention/kernel/cutedsl/</code> 源码、标注真实行号并链接 GitHub）、
+              深入解析（含数学推导与辅图）、5–7 道练习。
+            </p>
+          </div>
+        </header>
+        <div class="chapter-grid" id="chapter-grid"></div>
+      </section>
+
+      <section class="section" id="sources">
+        <header class="section-head">
+          <span class="section-no">III</span>
+          <div>
+            <h2>权威来源</h2>
+            <p>源码为最高权重信源；博客与论文用于设计动机与数学背景。</p>
+          </div>
+        </header>
+        <ol class="source-list">
+          <li><span><a href="https://github.com/SandAI-org/MagiAttention" target="_blank" rel="noreferrer">SandAI-org/MagiAttention · 源码仓库（kernel/cutedsl 为本课程主信源）</a></span></li>
+          <li><span><a href="https://sandai-org.github.io/MagiAttention/docs/" target="_blank" rel="noreferrer">MagiAttention 官方文档与博客（AttnSlice、负载均衡、GroupCast/GroupReduce、Blackwell 支持）</a></span></li>
+          <li><span><a href="https://arxiv.org/abs/2505.13211" target="_blank" rel="noreferrer">MagiAttention 论文：A Distributed Attention Towards Linear Scalability</a></span></li>
+          <li><span><a href="https://github.com/NVIDIA/cutlass/tree/main/examples/77_blackwell_fmha" target="_blank" rel="noreferrer">CUTLASS Example 77 · Blackwell FMHA（SM100 kernel 的直接蓝本）</a></span></li>
+          <li><span><a href="https://arxiv.org/abs/2407.08608" target="_blank" rel="noreferrer">FlashAttention-3 论文（异步与 warp 特化的方法论基础）</a></span></li>
+          <li><span><a href="https://docs.nvidia.com/cuda/parallel-thread-execution/" target="_blank" rel="noreferrer">NVIDIA PTX ISA · tcgen05 指令族与 Tensor Memory</a></span></li>
+        </ol>
+      </section>
+      </main>
+
+      <footer class="footer">
+        <span>FFA on Blackwell · 教学重绘，非官方项目 · 进度仅存于浏览器本地</span>
+      </footer>
+    </div>
+  </body>
+</html>
