@@ -503,7 +503,7 @@ button { font: inherit; }
 .takeaway p { margin: 7px 0 0; font-family: var(--serif); }
 
 .chapter-toc {
-  margin: -26px 0 0;
+  margin: 24px 0 0;
   padding: 16px 22px;
   border: 1px solid var(--rule);
   border-radius: 12px;
@@ -517,15 +517,18 @@ button { font: inherit; }
   text-transform: uppercase;
 }
 .chapter-toc ol {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 24px;
+  columns: 3;
+  column-gap: 28px;
   margin: 10px 0 0;
   padding: 0;
   list-style: none;
 }
+.chapter-toc li {
+  break-inside: avoid;
+  margin: 0 0 6px;
+}
 .chapter-toc a {
-  display: inline-flex;
+  display: flex;
   align-items: baseline;
   gap: 7px;
   color: var(--ink-2);
@@ -1745,6 +1748,7 @@ details p { margin-bottom: 0; }
   .path-grid, .chapter-grid { grid-template-columns: repeat(2, 1fr); }
   .section-head { grid-template-columns: 110px 1fr; }
   .legend, .lineage-wrap { margin-left: 158px; }
+  .chapter-toc ol { columns: 2; }
   .constraint-grid, .intuition-grid { grid-template-columns: 1fr 1fr; }
   .position-steps, .position-step-grid, .position-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .calculator { grid-template-columns: repeat(3, 1fr); }
@@ -1765,6 +1769,7 @@ details p { margin-bottom: 0; }
   .section-no { font-size: 34px; }
   .legend, .lineage-wrap { margin-left: 0; }
   .chapter-hero { padding-top: 48px; }
+  .chapter-toc ol { columns: 1; }
   .chapter-nav { grid-template-columns: 1fr; }
   .chapter-nav .next { text-align: left; }
   .report-figure { width: calc(100vw - 30px); }

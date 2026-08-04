@@ -8,7 +8,7 @@
       content="逐特性拆解 MagiAttention 的 Blackwell (SM100) Flex-Flash-Attention 算子：AttnSlice、TMEM、Warp 特化流水线、块级 Mask、Online Softmax、Correction、Tile Scheduler、反向与通算融合。"
     />
     <title>FFA on Blackwell · MagiAttention SM100 算子教程</title>
-    <link rel="stylesheet" href="assets/styles.css?v=20260804-2" />
+    <link rel="stylesheet" href="assets/styles.css?v=20260804-3" />
     <link
       rel="stylesheet"
       href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css"
@@ -88,14 +88,14 @@
           <g aria-hidden="true">
             <path class="hero-map__edge" d="M240 92V122" />
             <path class="hero-map__edge" d="M240 160V190" />
-            <path class="hero-map__edge" d="M240 228V258H120V288" />
+            <path class="hero-map__edge" d="M240 228V258H96V288" />
             <path class="hero-map__edge" d="M240 228V288" />
-            <path class="hero-map__edge" d="M240 228V258H360V288" />
-            <path class="hero-map__edge" d="M120 326V356" />
+            <path class="hero-map__edge" d="M240 228V258H384V288" />
+            <path class="hero-map__edge" d="M96 326V356" />
             <path class="hero-map__edge" d="M240 326V356" />
-            <path class="hero-map__edge" d="M360 326V356" />
-            <path class="hero-map__edge hero-map__edge--compose" d="M120 394V424H228V454" />
-            <path class="hero-map__edge hero-map__edge--compose" d="M360 394V424H252V454" />
+            <path class="hero-map__edge" d="M384 326V356" />
+            <path class="hero-map__edge hero-map__edge--compose" d="M96 394V424H228V454" />
+            <path class="hero-map__edge hero-map__edge--compose" d="M384 394V424H252V454" />
           </g>
 
           <g text-anchor="middle">
@@ -113,28 +113,28 @@
             </g>
 
             <g class="hero-map__node hero-map__node--compute">
-              <rect x="48" y="288" width="144" height="38" rx="9" />
-              <text x="120" y="312">03 块级 Mask</text>
+              <rect x="32" y="288" width="128" height="38" rx="9" />
+              <text x="96" y="312">03 块级 Mask</text>
             </g>
             <g class="hero-map__node hero-map__node--compute">
-              <rect x="168" y="288" width="144" height="38" rx="9" />
+              <rect x="176" y="288" width="128" height="38" rx="9" />
               <text x="240" y="312">04 Online Softmax</text>
             </g>
             <g class="hero-map__node hero-map__node--remote">
-              <rect x="288" y="288" width="144" height="38" rx="9" />
-              <text x="360" y="312">05 Correction</text>
+              <rect x="320" y="288" width="128" height="38" rx="9" />
+              <text x="384" y="312">05 Correction</text>
             </g>
 
             <g class="hero-map__node hero-map__node--dispatch">
-              <rect x="48" y="356" width="144" height="38" rx="9" />
-              <text x="120" y="380">06 Tile Scheduler</text>
+              <rect x="32" y="356" width="128" height="38" rx="9" />
+              <text x="96" y="380">06 Tile Scheduler</text>
             </g>
             <g class="hero-map__node hero-map__node--remote">
-              <rect x="288" y="356" width="144" height="38" rx="9" />
-              <text x="360" y="380">07 反向传播</text>
+              <rect x="320" y="356" width="128" height="38" rx="9" />
+              <text x="384" y="380">07 反向传播</text>
             </g>
             <g class="hero-map__node hero-map__node--communication">
-              <rect x="168" y="356" width="144" height="38" rx="9" />
+              <rect x="176" y="356" width="128" height="38" rx="9" />
               <text x="240" y="380">Fwd 主循环合体</text>
             </g>
 
