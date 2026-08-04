@@ -1053,45 +1053,39 @@
   function auxCpCommunication(rootId) {
     var b = "";
 
-    b += panel(40, 52, 1020, 140, "均匀输入分片示例 · CP=4 · packed tensor（实际 stage 以 CommMeta 为准）", "control");
-    b += box(50, 88, 230, 76, "Rank 0", "Q₀ [1024,16,128] · K₀/V₀ [1024,4,128]", "compute", null, null, { subSize: 8.2 });
-    b += box(305, 88, 230, 76, "Rank 1", "Q₁ [1024,16,128] · K₁/V₁ [1024,4,128]", "compute", null, null, { subSize: 8.2 });
-    b += box(560, 88, 230, 76, "Rank 2", "Q₂ [1024,16,128] · K₂/V₂ [1024,4,128]", "compute", null, null, { subSize: 8.2 });
-    b += box(815, 88, 230, 76, "Rank 3", "Q₃ [1024,16,128] · K₃/V₃ [1024,4,128]", "compute", null, null, { subSize: 8.2 });
+    /* Left: canonical Ring Attention layout (paper Fig.2) as the reference. */
+    b += panel(40, 52, 490, 370, "对照 · Ring Attention 固定环形轮转", "control");
+    b += box(100, 108, 150, 64, "rank 0", "Q₀ 常驻 · KV 轮转", "control", null, null, { subSize: 8.4 });
+    b += box(340, 108, 150, 64, "rank 1", "Q₁ 常驻 · KV 轮转", "control", null, null, { subSize: 8.4 });
+    b += box(340, 248, 150, 64, "rank 2", "Q₂ 常驻 · KV 轮转", "control", null, null, { subSize: 8.4 });
+    b += box(100, 248, 150, 64, "rank 3", "Q₃ 常驻 · KV 轮转", "control", null, null, { subSize: 8.4 });
+    b += edge(rootId, "M250 140H340", [295, 126, "K/V", 44, 8.4], "gather");
+    b += edge(rootId, "M415 172V248", null, "gather");
+    b += edge(rootId, "M340 280H250", null, "gather");
+    b += edge(rootId, "M175 248V172", null, "gather");
+    b += textLabel(285, 352, "每步把手上的 K/V 分片发给下一 rank，同时接收上一 rank 的分片；", 9.8, P.muted, 500);
+    b += textLabel(285, 374, "CP−1 步后每个 Q 见过全部 KV——mask 用不到的分片也要绕行一圈。", 9.8, P.muted, 500);
 
-    b += panel(40, 232, 1020, 150, "默认 KV-COMM · 前向", "gather");
-    b += box(60, 270, 215, 72, "Rank 2 · KV 属主", "chunk c: K/V [256,4,128]", "control", null, null);
-    b += box(325, 270, 210, 72, "GroupCast(c)", "dst=[0,3] · 每个目标 512 KiB", "gather", null, null);
-    b += box(585, 270, 220, 72, "Rank 0 / Rank 3", "各收到一份 K/V chunk c", "compute", null, null);
-    b += box(855, 270, 185, 72, "FFA + 本地合并", "out_acc/lse_acc · 不上网", "state", null, null, { subSize: 8.2 });
-    b += edge(rootId, "M275 306H325", null, "control");
-    b += edge(rootId, "M535 306H585", null, "gather");
-    b += edge(rootId, "M805 306H855", null, "compute");
+    /* Right: MagiAttention replaces rotation with dependency-driven multicast. */
+    b += panel(560, 52, 500, 370, "MagiAttention · GroupCast 按依赖多播", "gather");
+    b += box(580, 170, 100, 64, "rank 0", "需要分片 c", "compute", null, null, { subSize: 8.4 });
+    b += box(705, 170, 100, 64, "rank 1", "不需要 · 不收", "compute", null, null, { dashed: true, subSize: 8.4 });
+    b += box(830, 170, 100, 64, "rank 2", "分片 c 属主", "control", null, null, { subSize: 8.4 });
+    b += box(955, 170, 100, 64, "rank 3", "需要分片 c", "compute", null, null, { subSize: 8.4 });
+    b += edge(rootId, "M880 170V118H630V170", [750, 104, "前向 GroupCast：K_c/V_c 一步多播", 250, 8.6], "gather");
+    b += edge(rootId, "M930 202H955", null, "gather");
+    b += edge(rootId, "M630 234V292H880V234", [748, 306, "反向 GroupReduce(sum)：dK_c/dV_c 加和回属主", 330, 8.6], "state", true);
+    b += edge(rootId, "M1005 234V264H905V234", [1004, 278, "dK_c/dV_c", 88, 8.2], "state", true);
+    b += textLabel(810, 352, "依赖清单来自 AttnSlice/CommMeta：dst_indices[c]=[0,3]，一步直达；", 9.8, P.muted, 500);
+    b += textLabel(810, 374, "rank 1 不在清单上，一个字节也不收；Q 与 partial out/LSE 留在本地合并。", 9.8, P.muted, 500);
 
-    b += panel(40, 432, 1020, 150, "默认 KV-COMM · 反向", "state");
-    b += box(60, 470, 215, 72, "Rank 0 / Rank 3", "各自产生 partial dK_c / dV_c", "compute", null, null, { subSize: 8.3 });
-    b += box(325, 470, 210, 72, "GroupReduce(sum)", "src=[0,3] · fp32 累加可选", "gather", null, null);
-    b += box(585, 470, 220, 72, "Rank 2 · KV 属主", "得到完整 dK_c / dV_c", "control", null, null);
-    b += box(855, 470, 185, 72, "dQ 留在 Q 属主", "本地累加 · 不走网络", "control", null, null, { dashed: true, subSize: 8.2 });
-    b += edge(rootId, "M275 506H325", null, "compute");
-    b += edge(rootId, "M535 506H585", null, "gather");
-
-    b += panel(40, 632, 1020, 150, "QO-COMM · 可选的前向对偶路径", "orange");
-    b += box(60, 670, 190, 72, "Q 属主", "Q chunk [256,16,128]", "compute", null, null);
-    b += box(300, 670, 210, 72, "GroupCast(Q)", "把 Q 发到需要计算的 KV rank", "gather", null, null, { subSize: 8.2 });
-    b += box(560, 670, 220, 72, "KV 属主 · FFA", "本地 KV × 远端 Q", "compute", null, null);
-    b += box(830, 670, 210, 72, "GroupReduce(lse)", "out/LSE 加权合并回 Q 属主", "state", null, null, { subSize: 8.2 });
-    b += edge(rootId, "M250 706H300", null, "compute");
-    b += edge(rootId, "M510 706H560", null, "gather");
-    b += edge(rootId, "M780 706H830", null, "compute");
-
-    b += textLabel(550, 810,
-      "紫色 = MagiAttention GroupCast / GroupReduce；蓝色 = FFA 计算；绿色 = 数据属主/本地状态；玫瑰 = partial 结果。",
+    b += textLabel(550, 452,
+      "两者都把通信藏进计算的影子；差别在通信量：环形轮转固定传全量 KV，GroupCast 只传 mask 真正依赖的分片。",
       10.2, P.muted, 500);
     return {
-      svg: baseSvg(rootId, "cp-communication", 840, b,
-        "Context-parallel tensor flow through GroupCast and GroupReduce"),
-      caption: "CP=4 的 tensor 流向：默认 KV-comm 在前向多播 K/V、在反向归约 dK/dV；qo_comm 则多播 Q，并把 partial out/LSE 按 LSE 规则归约回 Q 属主。"
+      svg: baseSvg(rootId, "cp-communication", 484, b,
+        "Ring Attention rotation versus MagiAttention dependency-driven GroupCast"),
+      caption: "左：Ring Attention 的经典画法——Q 常驻，K/V 分片沿固定环逐步轮转。右：MagiAttention 不轮转，GroupCast 沿依赖清单把分片一步多播给需要它的 rank，反向用 GroupReduce 沿同一清单把 dK/dV 加和回属主；Q 与 partial out/LSE 始终留在本地。"
     };
   }
 
