@@ -167,7 +167,7 @@
     function apply() {
       workbench.classList.remove("is-height-synced");
       workbench.style.removeProperty("--workbench-height");
-      if (!window.matchMedia("(min-width: 1800px)").matches) return;
+      if (!window.matchMedia("(min-width: 1500px)").matches) return;
       var unified = pane.offsetHeight;
       if (!isFinite(unified) || unified < 200) return;
       workbench.style.setProperty("--workbench-height", unified + "px");

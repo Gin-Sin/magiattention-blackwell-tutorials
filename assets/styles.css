@@ -703,11 +703,6 @@ button { font: inherit; }
   .chapter-toc__item--child > .chapter-toc__link::before {
     left: -11px;
   }
-  .chapter-main .report-figure:not(.is-expanded) {
-    width: min(1440px, calc(50vw + 416px));
-    margin-left: 100%;
-    transform: translateX(-100%);
-  }
 }
 
 .constraint-grid,
@@ -1182,9 +1177,9 @@ body.diagram-is-open { overflow: hidden; }
 .architecture-workbench .code-ide__editor {
   height: clamp(420px, 48vh, 480px);
 }
-@media screen and (min-width: 1800px) {
+@media screen and (min-width: 1500px) {
   .architecture-workbench {
-    /* Keep both columns readable after reserving the right rail for the TOC. */
+    /* Diagram column gets >=840px of the 1440px workbench at 1500px+. */
     grid-template-columns: minmax(840px, 1.18fr) minmax(460px, .82fr);
     align-items: start;
   }
