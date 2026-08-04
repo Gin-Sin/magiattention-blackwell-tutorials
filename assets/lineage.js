@@ -18,9 +18,9 @@
     },
     {
       id: "semi", x: 660, y: 46, w: 260, tone: "remote", no: "00",
-      title: "out / LSE 可合并半群", sub: "任意顺序、任意分组合并",
+      title: "out / LSE 可合并结果", sub: "实数运算下可交换、可结合",
       chapter: "attnslice",
-      detail: "两个 partial 结果 (out₁,lse₁)、(out₂,lse₂) 可用封闭公式合并，且满足交换律与结合律。这一数学性质是切片可重叠、块可乱序、rank 可分布的统一许可——单卡与分布式共享同一个代数结构。"
+      detail: "两份局部结果可用固定公式合并。实数运算下，该操作满足交换律和结合律，空结果还是单位元；浮点实现可能因顺序不同出现微小舍入差异。"
     },
 
     /* L1 · 硬件基座 */
@@ -28,13 +28,13 @@
       id: "tmem", x: 120, y: 164, w: 220, tone: "dispatch", no: "01",
       title: "TMEM 常驻累加", sub: "S / P / O 不占寄存器堆",
       chapter: "blackwell",
-      detail: "Blackwell 的 Tensor Memory 让 128×512 fp32 的累加器脱离寄存器堆常驻片上：S、P、O 通过 T2R/R2T 精确搬运，寄存器全部让给 softmax 的逐元素计算。"
+      detail: "Blackwell 的 Tensor Memory 专门保存矩阵乘累加结果。S、P、O 通过 T2R/R2T 在 TMEM 与寄存器之间搬运，从而减少矩阵乘对普通寄存器的占用。"
     },
     {
       id: "engines", x: 370, y: 164, w: 250, tone: "dispatch", no: "01",
       title: "TMA / UMMA 异步引擎", sub: "单线程发射 · 硬件记账",
       chapter: "blackwell",
-      detail: "数据搬运（TMA）与矩阵乘（tcgen05 UMMA）都变成「单线程发射、硬件异步完成」的引擎。计算与搬运的并行不再靠人海战术，而靠少数驾驶员 warp 与 mbarrier 记账。"
+      detail: "TMA 负责数据搬运，tcgen05 UMMA 负责矩阵乘。warp 发出异步指令后，通过 mbarrier 得知数据或计算何时完成。"
     },
 
     /* L2 · kernel 执行 */
@@ -42,7 +42,7 @@
       id: "mask", x: 40, y: 282, w: 210, tone: "compute", no: "03",
       title: "三层 Mask 防线", sub: "跳块 → 三段循环 → R2P",
       chapter: "mask",
-      detail: "同一条「列界随行号线性移动」的几何驱动三层机制：BlockInfo 整块跳过（免费）、三段主循环隔离 partial 带（近免费）、R2P 位掩码逐元素写 -inf（只在对角带付钱）。"
+      detail: "BlockInfo 先跳过全无效块；主循环让全有效块直接走快路径；只有边界穿过的 partial 块才用 R2P 把无效分数写成 -inf。"
     },
     {
       id: "pipe", x: 290, y: 282, w: 230, tone: "communication", no: "02",
@@ -60,7 +60,7 @@
       id: "corr", x: 820, y: 282, w: 240, tone: "remote", no: "05",
       title: "Correction 收口", sub: "块间归约 · 写出 (out, lse)",
       chapter: "correction",
-      detail: "主循环用 corr_scale 还账、尾声用 1/ℓ 清算，最后写出 fp32 的 LSE——那是给「下一次合并」的收据：kernel 内块间归约与分布式 rank 间归约，是同一半群运算在两个尺度上的重复。"
+      detail: "主循环用 corr_scale 把旧 O 换到新的最大值基准，尾声再除以行和 ℓ，并写出 fp32 LSE。块间结果与 rank 间结果使用同一合并公式。"
     },
 
     /* L3 · 调度与反向 */
@@ -74,7 +74,7 @@
       id: "persist", x: 370, y: 400, w: 230, tone: "dispatch", no: "06",
       title: "Persistent Kernel", sub: "CTA 常驻 · tile 软件派发",
       chapter: "scheduler",
-      detail: "每 SM 常驻一个 CTA，work tile 由软件（或 CLC 硬件）逐个派发。CTA 数量成为一个可调参数——这正是后来 sm_margin 能「少开几个、让出地皮」的结构性前提。"
+      detail: "每个 CTA 连续处理多个 work tile，CTA 总数接近 SM 数。因为启动数量可调，sm_margin 才能让 FFA 少开若干 CTA，为通信 kernel 留出 SM。"
     },
     {
       id: "bwd", x: 650, y: 400, w: 250, tone: "compute", no: "07",
@@ -88,26 +88,26 @@
       id: "margin", x: 60, y: 518, w: 240, tone: "orange", no: "08",
       title: "sm_margin / KernelBarrier", sub: "给通信 kernel 让出 SM",
       chapter: "overlap",
-      detail: "异步 ≠ 并行：通信 kernel 也要 SM。NCCL 路径让 FFA persistent kernel 少开 sm_margin 个 CTA 留出地皮；native grpcoll 路径通信 kernel 自带 SM，用 KernelBarrier 钉死发射顺序、margin 归零。"
+      detail: "异步入队不代表同时运行：通信 kernel 也需要 SM。NCCL 路径用 sm_margin 留资源；native grpcoll 使用常驻通信 SM，并以 KernelBarrier 协调发射顺序。"
     },
     {
       id: "overlap", x: 350, y: 518, w: 250, tone: "communication", no: "08",
       title: "多阶段 Overlap 流水线", sub: "prefetch ∥ compute ∥ reduce",
       chapter: "overlap",
-      detail: "远端 KV 按成本模型切成 d 个 stage，每一拍并行三件事：预取第 i+1 段、计算第 i 段、归约第 i−1 段。通信藏进计算的影子——只有最后一段计算裸露，这是「线性可扩展」的工程形态。"
+      detail: "远端 KV 按成本模型切成 d 个 stage。理想情况下，每一拍同时预取第 i+1 段、计算第 i 段、处理第 i−1 段结果。实际收益还取决于队列和 SM 资源。"
     },
     {
       id: "grpcoll", x: 650, y: 518, w: 260, tone: "communication", no: "08",
       title: "GroupCast / GroupReduce", sub: "按依赖清单精确投递",
       chapter: "overlap",
-      detail: "「一段发多家」与「多家归一段」两条原语，输入就是 AttnSlice 分析出的依赖清单：不在 mask 里的 (Q,K) 对一个字节都不上网络。reduce_op=\"lse\" 让归约本身执行半群合并公式。"
+      detail: "GroupCast 按依赖清单把一段数据发给多个 rank；GroupReduce 把多个来源的对应段送回属主并合并。reduce_op=\"lse\" 使用 out/LSE 合并公式。"
     }
   ];
 
   var EDGES = [
     { from: "rep", to: "semi", d: "M390 75H660", label: "切片可重叠、跨 rank ⇒ 输出必须可合并" },
     { from: "rep", to: "mask", d: "M155 104V140H90V282", label: "四种几何的列界都是行号的线性函数" },
-    { from: "semi", to: "corr", d: "M900 104V140H1010V282", label: "kernel 内块间合并 = 同一半群运算" },
+    { from: "semi", to: "corr", d: "M900 104V140H1010V282", label: "kernel 内块间结果使用同一合并公式" },
     { from: "semi", to: "grpcoll", d: "M900 104V126H1080V498H850V518", label: "reduce_op=\"lse\" 直接实现合并公式" },
     { from: "tmem", to: "softmax", d: "M230 222V252H620V282", label: "S/P 常驻片上 · T2R/R2T 免搬运" },
     { from: "engines", to: "pipe", d: "M450 222V282", label: "异步引擎需要 warp 特化来驾驶" },
@@ -117,7 +117,7 @@
     { from: "corr", to: "grpcoll", d: "M930 340V486H880V518", label: "(out, lse) 是 GroupReduce 的载荷" },
     { from: "sched", to: "persist", d: "M320 429H370", label: "同一个 while work_tile 消费骨架" },
     { from: "persist", to: "margin", d: "M420 458V488H240V518", label: "CTA 数可调 ⇒ 少开即让出 SM" },
-    { from: "margin", to: "overlap", d: "M300 547H350", label: "通信有地皮，预取才真正并行" },
+    { from: "margin", to: "overlap", d: "M300 547H350", label: "通信获得 SM，预取才可能并行" },
     { from: "grpcoll", to: "overlap", d: "M650 547H600", label: "按清单投递的原语是流水线的积木" },
     { from: "bwd", to: "overlap", d: "M700 458V492H520V518", label: "反向 dKV 归约同样进 overlap 环" }
   ];

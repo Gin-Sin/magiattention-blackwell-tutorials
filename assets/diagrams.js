@@ -356,11 +356,11 @@
       title: "AttnSlice 契约 · host 侧一次前向",
       badges: ["蓝 = 计算/实例化", "绿 = ranges 与 mask", "玫瑰 = 输出契约", "紫 = 折叠/启动", "青 = 编译缓存"],
       notes: [
-        ["入口三元组", "q/k/v 张量 + [N,2] 的 q_ranges/k_ranges + 单一 mask_type;sink/softcap 是可选修饰。"],
-        ["Step-1 折叠", "当前 CuTe DSL 路径要求 ranges 等价于 cu_seqlens 分段:从 0 起、连续、不重叠。"],
-        ["输出契约", "lse 恒为 fp32、空集初值 -inf;functional 层在 ranges 可能重叠时把 out 升为 fp32 并 atomic 累加。"],
-        ["启发式决策", "tile=128×128;q_stage 由序列长度定;2-CTA 要求非 causal/varlen/稀疏且 head_dim 合规;CLC 排除两类回退场景。"],
-        ["编译缓存", "所有静态分支进 compile_key;首次 cute.compile,之后 tvm-ffi 直接启动,免去元数据转换。"]
+        ["输入", "q_ranges/k_ranges 用 [start,end) 选出 Q、K 区间，mask_type 指定区间内部的几何。"],
+        ["当前限制", "CuTe DSL 路径要求 ranges 从 0 开始、连续且不重叠，因此可转换为 cu_seqlens。"],
+        ["输出", "LSE 始终为 fp32，空集记为 -inf；可能重叠时，functional 路径还会用 fp32 out 做原子累加。"],
+        ["选择配置", "host 根据序列长度、mask 和 head_dim 选择 Q stage、2-CTA 与 CLC。"],
+        ["编译缓存", "所有会改变生成代码的配置都进入 compile_key；相同 key 只需编译一次。"]
       ],
       memory: "一句话:ranges 进、(out,lse) 出;中间全是编译期决策。"
     };
@@ -404,11 +404,11 @@
       title: "SM100 执行基座 · 数据只向前流",
       badges: ["橙 = GMEM/TMA", "蓝 = SMEM", "玫瑰 = TMEM", "紫 = UMMA"],
       notes: [
-        ["三层存储", "GMEM --TMA--> SMEM --UMMA--> TMEM;累加器全程驻留 TMEM,不占寄存器堆。"],
-        ["TMEM 地图", "S0/S1 占 [0,256),O0/O1 占 [256,512);bf16 的 P 叠放在 S 后半,row_max/sum 向量复用 S 空间。"],
-        ["两个 GEMM", "QK 的 A/B 都在 SMEM;PV 的 A(即 P)声明 OperandSource.TMEM,免去 SMEM 中转。"],
-        ["生命周期", "仅 MMA warp 分配/释放 TMEM;softmax+correction 通过 TmemPtr barrier 见证释放安全。"],
-        ["2-CTA", "cluster 内两个 CTA 组队:MMA tiler M 翻倍到 256,K/V 的 SMEM 各存一半,kv_stage 翻倍。"]
+        ["数据路线", "TMA 把 GMEM 数据搬到 SMEM，UMMA 计算后把累加结果放进 TMEM。"],
+        ["TMEM 地图", "S0/S1 和 O0/O1 各占 128 列；S 被读走后，其空间再存 bf16 P 与行统计量。"],
+        ["两个矩阵乘", "QK 从 SMEM 读取 Q/K；PV 直接从 TMEM 读取 P，省去一次 SMEM 中转。"],
+        ["生命周期", "MMA warp 分配和释放 TMEM；释放前必须等待 softmax 与 correction 完成最后一次访问。"],
+        ["2-CTA", "两个 CTA 共同处理 256 行 Q，并各存一半 K/V。只有双方负载接近时才启用。"]
       ],
       memory: "SMEM 喂数据、TMEM 存累加、UMMA 单 warp 发射——寄存器全部让给 softmax。"
     };
@@ -431,7 +431,7 @@
     b += box(780, 312, 240, 76, "pipeline_o_acc", "仅尾块 · O-full 显式等待", "state", 8, "05");
     b += box(470, 442, 250, 76, "pipeline_o_epi", "correction → epilogue", "gather", null, "04", { dashed: true });
     b += box(780, 442, 240, 76, "cross-release", "单 correction 轮转两 softmax", "state", null, "06", { dashed: true });
-    b += box(470, 582, 550, 64, "warp_idx 分派 · 一份代码七种人生", "setmaxregister ↓↑ 后进入各自 loop", "cyan", 9, "07");
+    b += box(470, 582, 550, 64, "warp_idx 分派 · 一份代码七种角色", "setmaxregister 调整后进入各自循环", "cyan", 9, "07");
 
     b += edge(rootId, "M310 124H470", [382, 110, "producer", 76, 8.2], "compute");
     b += edge(rootId, "M310 224H470", [382, 210, "S-full", 76, 8.2], "compute");
@@ -449,11 +449,11 @@
       title: "16 个 warp · 六条流水线",
       badges: ["蓝 = warp 角色", "紫 = 流水线", "玫瑰 = sScale/O 同步", "青 = 分派"],
       notes: [
-        ["角色即资源", "softmax 独享高寄存器配额;load/MMA/epilogue 是异步引擎的驾驶员,只留最低配额。"],
-        ["双义槽位", "pipeline_s_p_o 一个槽位 track 两种转移:MMA commit S-full;softmax(P 写完)+correction(O 校准完)联合 release。"],
-        ["sScale 协议", "RAW 用 named barrier(数据就绪),WAR 用 pipeline(槽位可覆写);correction 的 cross-release 让两组 softmax 错峰。"],
-        ["尾块特例", "主循环靠 GEMM 顺序免等 O;最后一块该保证断裂,pipeline_o_acc 补上显式等待。"],
-        ["统一骨架", "所有角色都是同一个 while work_tile 循环;warp_idx 分派 + 编译期 const_expr 让分支零开销。"]
+        ["角色与资源", "softmax 获得最多寄存器；load、MMA、epilogue 主要发起异步指令，只需较少寄存器。"],
+        ["S/P/O 槽位", "S 写完后 softmax 才能读；P 写完且旧 O 校准完后，MMA 才能开始 PV。"],
+        ["sScale 协议", "RAW 保证写完才读，WAR 保证读完才覆盖；cross-release 让两组 softmax 错峰。"],
+        ["最后一个 block", "主循环可由 GEMM 顺序推断旧 O 已完成；最后一块没有后继信号，必须显式等待。"],
+        ["统一循环", "所有角色都处理同一个 work_tile 循环，只由 warp_idx 选择各自工作。"]
       ],
       memory: "warp 之间不传数据,只翻转槽位状态;数据永远躺在约定好的 TMEM/SMEM 里。"
     };
@@ -462,7 +462,7 @@
   function maskDiagram(rootId) {
     var b = "";
     b += box(70, 60, 430, 64, "Q tile (m_block) + SeqlenInfoQK", "相对坐标系 · cu_seqlens 读一次", "compute", 1, "07");
-    b += box(600, 60, 420, 64, "端对齐几何", M("k \\le q + (s_k - s_q)", "k <= q + (sk - sq)"), "cyan", null, "01");
+    b += box(600, 60, 420, 64, "右下对齐 causal · 坐标均从 0 开始", M("k \\le q + (s_k - s_q)", "k <= q + (sk - sq)"), "cyan", null, "01");
 
     b += panel(40, 176, 1020, 128, "第一层 · BlockInfo 跳块(免费)", "control");
     b += box(90, 210, 400, 66, "get_n_block_min_max", "整块非法的 n_block 不迭代", "control", 2, "01");
@@ -492,13 +492,13 @@
       title: "块级 Mask · 三层防线",
       badges: ["绿 = 跳块/full", "橙 = partial 带", "玫瑰 = 元素级", "青 = 几何"],
       notes: [
-        ["一条不等式", "端对齐 causal 的列界是行号的线性函数,同一几何驱动三层机制。"],
-        ["第一层免费", "BlockInfo 用 tile 角点代入不等式,整块非法的 KV block 循环压根不进。"],
-        ["第二层近免费", "三段循环把 partial 块隔离在对角带;full 段的 softmax_step 编译期就没有 mask 代码。"],
-        ["第三层高效", "R2P 把 32 列的 keep/drop 打进一个 uint32,一次散到 32 个谓词寄存器;local 双界取 AND。"],
-        ["可编程出口", "超出 causal/local 表达力时走 mask_mod 谓词,配合 CSR block-sparse 表限定范围。"]
+        ["符号", "q/k 是切片内从 0 开始的行列下标，s_q/s_k 是 Q/K 长度；长度相等时公式退化为 k≤q。"],
+        ["先跳过", "BlockInfo 用 tile 角点判断整块是否无效；无效 K block 不进入循环。"],
+        ["再分段", "边界块走 partial 段并应用 mask；完全有效块走不含 mask 代码的 full 段。"],
+        ["最后处理元素", "R2P 把连续 32 列的保留结果编码成一个 uint32，再转换为 32 个谓词。"],
+        ["任意 mask", "无法用左右边界表示时，CSR 表先列出相关块，partial 块再调用 mask_mod。"]
       ],
-      memory: "先跳块,再挑块,最后才逐位改元素——mask 的钱只花在对角带上。"
+      memory: "先跳过无效块，再直接计算完整块，最后只处理边界块内的元素。"
     };
   }
 
@@ -534,11 +534,11 @@
       title: "softmax_step · 一个 KV block 的九个动作",
       badges: ["蓝 = 计算", "绿 = 挂载点", "紫 = 指数与写回", "玫瑰 = 发布", "橙 = 支撑机制"],
       notes: [
-        ["早发布", "corr_scale 在 row_max 更新后立即写 sScale 并 arrive——correction 的 O-rescale 与本 warp 的 exp2 全程并行。"],
-        ["换底", "所有指数以 2 为底:scale_log2 = softmax_scale · log2(e),内层只剩 packed FMA 和 ex2。"],
-        ["双管线指数", "SFU 吞吐不够时按 ex2_emu_freq 把部分 exp2 换成 FMA 管线的多项式仿真;SM103 SFU 快,全部归零。"],
-        ["提前放行", "P 写到 3/4 就 release,PV GEMM 先启动,读尾部前等 p_lastsplit 信号。"],
-        ["错峰收尾", "WAR acquire 之后才更新 row_sum:把无依赖的寄存器计算塞进可能阻塞的等待窗口。"]
+        ["尽早发布", "行最大值更新后立即发送 corr_scale，使 correction 可与当前 exp2 并行缩放旧 O。"],
+        ["以 2 为底", "提前把 log2(e) 合入 softmax scale，内层直接使用 exp2。"],
+        ["分担指数计算", "B200 的 SFU 忙时，部分 exp2 改由 FMA 多项式近似；SM103 不需要该优化。"],
+        ["提前启动 PV", "P 写完前 3/4 后即可启动 PV；读取最后 1/4 前再等待完整就绪信号。"],
+        ["填补等待", "确认旧 scale 已读走后再更新 row_sum，用寄存器计算覆盖潜在等待时间。"]
       ],
       memory: "减 max、exp2、写 P 是明线;corr_scale 的早发布和 row_sum 的晚更新是暗线。"
     };
@@ -570,16 +570,16 @@
     return {
       svg: baseSvg(rootId, "correction", 620, b,
         "Correction main loop and epilogue"),
-      title: "Correction · 还账与清算",
+      title: "Correction · 校准与归一化",
       badges: ["蓝 = 计算", "绿 = 门控", "紫 = TMEM 读改写", "玫瑰 = 同步", "橙 = 尾声", "青 = LSE"],
       notes: [
-        ["一个槽位两种货", "sScale 主循环装 corr_scale,尾声装 row_sum/row_max(偏移 q_stage×128)。"],
-        ["ballot 门控", "warp 整体投票,全票 ≈1 就跳过整块 rescale——与 softmax 侧 rescale_threshold 成对。"],
-        ["免等 O 的推理", "scale 可读 ⇒ S(i) GEMM 已完 ⇒ 同 warp 上 O(i-1) GEMM 更早完成;唯尾块需显式等 o_acc。"],
-        ["cross-release", "释放对面 stage 的槽位,单组 correction 圆舞曲式轮转服务两组 softmax。"],
-        ["数值收口", "空行 scale 兜底 1、sink 只进分母、FP8 的 descale/max_offset 一并在 rcp 处回补。"]
+        ["分开存放", "sScale 的主循环区域存 corr_scale，另一片区域存尾声所需的 row_sum/row_max。"],
+        ["整 warp 跳过", "若 32 行的 scale 都为 1，整个 warp 不再读改 O。"],
+        ["O 的完成条件", "主循环可由 GEMM 发射顺序推断旧 O 已完成；最后一块必须显式等待。"],
+        ["cross-release", "释放另一 stage 的槽位，强制 correction 在两组 softmax 之间交替服务。"],
+        ["最终归一化", "空行写 0/-inf；sink 只增加分母；FP8 缩放也在此还原。"]
       ],
-      memory: "主循环还 corr_scale 的债,尾声用 1/ℓ 清算;LSE 是写给下一次合并的收据。"
+      memory: "主循环用 corr_scale 校准旧 O，尾声除以行和，并写出可继续合并的 O/LSE。"
     };
   }
 
@@ -615,11 +615,11 @@
       title: "调度层 · 顺序 × 亲和 × 分配方式",
       badges: ["青 = 选型", "蓝 = 静态排序", "紫 = CLC 硬件", "绿 = 统一骨架", "橙 = 回退"],
       notes: [
-        ["选型决策树", "varlen → 前缀和调度;causal/local/CLC → LPT;dense persistent → grid-stride;兜底 single-tile。"],
-        ["L2 swizzle", "估算 L2 能同居几个 head 的 K/V,让时间相邻的 CTA 空间上共享——命中率即有效带宽。"],
-        ["LPT", "块序反转,最重的 causal 尾块最先派发;Graham 定理保证 4/3 近似,线性递增负载下近乎最优。"],
-        ["CLC", "persistent CTA 向硬件申请下一份工作,响应经 mbarrier 通知;软件不再做 swizzle——顺序控制权只能有一个主人。"],
-        ["回退智慧", "dense noncausal 本来均衡、varlen-MHA 伤 L2:动态调度是保险,均匀负载不值得付保费。"]
+        ["选型", "varlen 使用前缀和定位；causal/local 使用 LPT；稠密均匀负载使用静态 persistent；另有简单兜底。"],
+        ["L2 swizzle", "估算 L2 可同时容纳多少个 head 的 K/V，并让相邻 CTA 尽量复用这些数据。"],
+        ["LPT", "反转 causal block 顺序，让工作最重的尾部 block 最先开始。"],
+        ["CLC", "persistent CTA 向硬件领取下一项工作，响应经 mbarrier 到达；实际派发顺序由硬件决定。"],
+        ["何时回退", "负载均匀时动态请求只有额外开销；varlen MHA 还可能因顺序变化降低 L2 命中率。"]
       ],
       memory: "LPT 管顺序,swizzle 管亲和,CLC 管分配——三个正交自由度各司其职。"
     };
@@ -660,11 +660,11 @@
       title: "反向三段式 · 以 K 为家",
       badges: ["绿 = pre/post", "蓝 = 计算", "紫 = GEMM 流水", "玫瑰 = 归约", "橙 = 确定性"],
       notes: [
-        ["预处理", "D = rowsum(dO⊙O) 免去存 P;LSE 预乘 log2(e) 服务 exp2;顺手清零 dQaccum。"],
-        ["以 K 为家", "固定 n_block,扫所有相关 m_block:dK/dV 在 TMEM 本地累加,免全局归约。"],
-        ["五连环", "S→dK→dQ→dP→dV 首尾相接;仅两处真 wait:dS 就绪、tdQ 被 reduce 消费(TMEM 复用约束)。"],
-        ["dQ 归约", "TMA 引擎直接在 gmem 的 fp32 dQaccum 上原子加;deterministic 不去掉 atomic,只用信号量钉死顺序。"],
-        ["收尾", "postprocess 把 dQaccum 乘 softmax_scale 转 dtype;dK 在 epilogue 乘 scale——缩放只花在 O(nd) 的输出上。"]
+        ["预处理", "先算每行 D=rowsum(dO⊙O)，预处理 LSE，并清零 fp32 dQaccum。"],
+        ["固定 K tile", "遍历相关 Q tile 时，dK/dV 一直在当前 CTA 的 TMEM 中累加。"],
+        ["五次矩阵乘", "重算 S/P，得到 dP/dV，再形成 dS，最后计算 dQ/dK；多步按流水线交错。"],
+        ["dQ 归约", "多个 K tile 都贡献 dQ，因此 TMA 原子加到全局 fp32 缓冲；确定性模式只固定加法顺序。"],
+        ["收尾", "postprocess 对 dQ 乘 softmax scale 并转换 dtype；dK 在自己的 epilogue 中做同类缩放。"]
       ],
       memory: "dK/dV 在家收快递,dQ 客场寄账;P 不存不传,LSE 一到就能重造。"
     };
@@ -689,7 +689,7 @@
     b += box(370, 508, 280, 70, "a2av 降解", "pack → all2all_v → post_process", "gather", 9, "06");
 
     b += panel(720, 472, 340, 150, "SM 分配", "orange");
-    b += box(750, 508, 280, 70, "sm_margin / KernelBarrier", "留地皮 或 发射顺序钉死", "orange", 10, "03");
+    b += box(750, 508, 280, 70, "sm_margin / KernelBarrier", "预留 SM 或协调发射顺序", "orange", 10, "03");
 
     b += edge(rootId, "M360 117H400", null, "control");
     b += edge(rootId, "M700 117H740", null, "control");
@@ -709,13 +709,13 @@
       title: "通算融合 · 三重奏与它的地基",
       badges: ["绿 = 求解/配置", "蓝 = 计算", "紫 = 通信原语", "玫瑰 = 归约", "橙 = SM 分配", "青 = 元数据"],
       notes: [
-        ["先切后跑", "OverlapSolver 按 max(通信ᵢ,计算ᵢ₋₁) 求和的成本模型把远端 KV 切成 stage;CommMeta 固化每 stage 的投递清单,训练全程复用。"],
-        ["三重奏", "主环每拍并行三件事:等第 i 段数据并预取第 i+1 段、用第 i 段算 FFA、把第 i−1 段的 partial 结果交给归约——通信全部藏进计算影子。"],
-        ["归约零成本", "默认 KV-comm 模式下 partial (out,lse) 全在本地:FFA kernel 拿上一拍结果当累加缓冲原子归约,reduce 句柄是空壳;走网络的是反向 dKV 与 qo_comm。"],
-        ["原语三层", "group_cast/group_reduce 一个签名三种实现:NCCL a2av 降解(pack/unpack)、native grpcoll(NVLink/RDMA 常驻 kernel)、hierarchical(跨节点只走一次 RDMA)。"],
-        ["SM 是要分的", "NCCL 路径:FFA persistent kernel 少开 sm_margin 个 CTA 给通信留地皮;native 路径:通信 kernel 自带 SM,KernelBarrier 钉死发射顺序,margin 归零。"]
+        ["先切 stage", "OverlapSolver 根据估计通信和计算时间切分远端 KV；每个 stage 的发送/接收清单可重复使用。"],
+        ["三拍流水", "计算第 i 段时预取 i+1，并处理 i-1 的结果；每拍时长由通信和计算中较慢者决定。"],
+        ["默认前向", "KV-comm 模式下 partial out/LSE 留在本地并由后续 kernel 合并；反向 dKV 与 qo_comm 才走网络归约。"],
+        ["三种实现", "同一 group_cast/group_reduce 接口可走 NCCL a2av、native grpcoll 或节点分层实现。"],
+        ["分配 SM", "NCCL 路径用 sm_margin 留出 CTA；native 路径让通信 kernel 常驻，并用 KernelBarrier 协调顺序。"]
       ],
-      memory: "切阶段、三重奏、让地皮——通信藏进计算的影子,只有最后一段计算裸露。"
+      memory: "切成多个 stage，预取/计算/归约错峰执行，并确保通信 kernel 真正拿得到 SM。"
     };
   }
 

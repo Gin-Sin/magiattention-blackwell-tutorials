@@ -815,7 +815,7 @@ _flex_flash_attn_fwd.compile_cache = get_jit_cache("fwd")`
         },
         {
           id: "07",
-          title: "warp 分派：一份代码，七种人生",
+          title: "warp 分派：一份代码，七种角色",
           start: 1894,
           end: 2115,
           code: C`        # //////////////////////////////////////////////////////////////
@@ -1857,7 +1857,7 @@ class ClcState(ParamsBase):
         },
         {
           id: "06",
-          title: "CLC 调度 warp 的完整人生",
+          title: "CLC 调度 warp 的完整流程",
           path: "magi_attention/kernel/cutedsl/ffa_fwd_sm100.py",
           start: 4886,
           end: 4913,
@@ -2456,7 +2456,7 @@ class ClcState(ParamsBase):
         },
         {
           id: "04",
-          title: "group_cast：一段发多家 · 三层实现分发",
+          title: "group_cast：一段发送到多个 rank",
           path: "magi_attention/comm/primitive/grpcoll/_group_collective.py",
           start: 81,
           end: 205,
@@ -2524,7 +2524,7 @@ class ClcState(ParamsBase):
         },
         {
           id: "05",
-          title: "group_reduce：多家归一 · \"lse\" 归约语义",
+          title: "group_reduce：合并多个 rank 的对应数据段",
           path: "magi_attention/comm/primitive/grpcoll/_group_collective.py",
           start: 255,
           end: 408,

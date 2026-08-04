@@ -23,17 +23,17 @@
       category: "dense",
       difficulty: "基础",
       source: "kernel/cutedsl/flex_flash_attn.py · 1537 行",
-      deck: R`在读一行 kernel 代码之前，先弄清这个算子对外的承诺：任意注意力 mask 被分解为 <code>AttnSlice = (QRange, KRange, MaskType)</code> 三元组的集合；输出 <code>out</code> 与 <code>lse</code> 携带可累加、可合并的数学结构。Blackwell 上的 CuTe DSL kernel 是这份契约的最新实现——本章同时讲清它当前兑现了契约的哪个子集。`,
-      takeaway: R`FFA 的本质是一次「语义降维」：把任意形状的 mask 拆成矩形切片 \(\mathrm{AttnSlice}=(Q\text{Range},K\text{Range},\text{MaskType})\)，每个切片只需 4 种基本几何（FULL / CAUSAL / INV-CAUSAL / BI-CAUSAL）。而让切片之间可以独立计算、事后合并的钥匙，是 <strong>fp32 累加的 out + 可合并的 LSE</strong>——这也是它能撑起分布式注意力的根本原因。`,
+      deck: R`先不看 kernel 代码，只看算子的输入和输出。MagiAttention 把复杂的注意力 mask 拆成若干 <code>AttnSlice</code>。每个切片只说明三件事：哪些 Q、哪些 K，以及它们之间使用哪种简单 mask。各切片可以分别计算，再用 <code>out</code> 和 <code>lse</code> 合并结果。本章还会明确 Blackwell CuTe DSL 路径目前支持到哪一步。`,
+      takeaway: R`把 <code>AttnSlice</code> 理解成一块矩形区域：<code>QRange</code> 选出若干 query 行，<code>KRange</code> 选出若干 key 列，<code>MaskType</code> 决定矩形内部哪些位置有效。复杂 mask 可以由多块矩形拼成。每块单独计算后，利用 fp32 <code>out</code> 和 LSE（log-sum-exp）即可合并。`,
       intuitions: [
         { label: "分解", title: "任意 mask = 矩形切片之并", body: R`每个切片是一块连续的 2D Q–K 区域，内部只有一种简单几何。切片列表在 CP rank 间重新分配后依然合法。` },
-        { label: "合并", title: "输出是半群", body: R`两个 partial 结果 \((out_1, lse_1)\)、\((out_2, lse_2)\) 可用封闭公式合并，与计算顺序无关（数学上）。` },
-        { label: "现状", title: "Blackwell 兑现子集", body: "CuTe DSL SM100 kernel 目前吃 cu_seqlens 等价的 ranges + 单一 full/causal，完整四类型靠上层切片分解与 SM90 JIT 路径。" }
+        { label: "合并", title: "局部结果可以再合并", body: R`两份局部结果 \((out_1,lse_1)\) 和 \((out_2,lse_2)\) 有稳定的合并公式。实数运算下顺序不影响结果；浮点运算可能有微小舍入差异。` },
+        { label: "现状", title: "先区分两条实现路径", body: "SM100 CuTe DSL 路径目前要求 ranges 连续且不重叠，并只原生处理 full/causal。完整四种类型由上层切片或 SM90 JIT 路径处理。" }
       ],
       motivation: [
-        R`FlashAttention 系列 kernel 假设 mask 结构规则（causal、滑窗、varlen），对<strong>不规则、跨 rank 分布的 mask</strong>（例如 Magi-1 的 varlen block-causal 视频掩码）会产生碎片化、负载不均和多余通信。MagiAttention 的答案是 Flex-Flash-Attention（FFA）：不是给 kernel 加更多 mask 分支，而是改变 mask 的<strong>表示</strong>。`,
-        R`仓库里有两套并行的 FFA 栈，教学时必须分清。<strong>生产主路径</strong>在 <code>magi_attention/functional/flex_flash_attn.py</code>，走 C++/CUTLASS JIT（SM90），支持任意重叠 ranges、四种 mask 类型、atomic 归约与 range merge。<strong>CuTe DSL 路径</strong>在 <code>magi_attention/kernel/cutedsl/</code>，源自 FA4/CUTLASS Blackwell FMHA 示例，是原生 SM100 kernel 所在地，也是本课程的主角。`,
-        R`本章交互源码全部来自 CuTe DSL 的 host 侧入口 <code>_flex_flash_attn_fwd</code>：从 ranges 折叠、形状检查、tile/2-CTA/CLC 启发式，到 compile_key 与 tvm-ffi 启动。读懂它，就拿到了后面 7 章所有静态配置的来源。`
+        R`规则 mask（如 causal 或滑动窗口）容易直接写进 kernel；不规则 mask 会带来大量分支、负载不均和无效通信。Flex-Flash-Attention（FFA）不继续增加分支，而是先把 mask 拆成规则切片。kernel 只处理这些简单切片。`,
+        R`仓库有两条 FFA 实现。<strong>functional/JIT 路径</strong>面向 SM90 生产使用，支持重叠 ranges 和四种 mask。<strong>CuTe DSL 路径</strong>面向 SM100，是本教程重点，但当前只实现了契约的一部分。后文出现“支持”时都会注明是哪条路径。`,
+        R`本章从 CuTe DSL 的 host 入口 <code>_flex_flash_attn_fwd</code> 开始。host 指 CPU 侧的 Python 调用代码；它负责检查输入、选择 tile 和调度配置、生成编译缓存键，再启动 GPU kernel。`
       ],
       diagram: {
         key: "attnslice",
@@ -43,44 +43,44 @@
         {
           title: "AttnSlice 三元组与四种 mask 几何",
           body: [
-            R`公共枚举 <code>AttnMaskType</code>（<code>magi_attention/common/enum.py</code>）定义了四种切片内几何：<code>FULL=0</code>、<code>CAUSAL=1</code>、<code>INVCAUSAL=2</code>、<code>BICAUSAL=3</code>。关键约定是<strong>对齐方向</strong>：CAUSAL 是「右下对齐」的下三角（Q 末端与 K 末端对齐），INV-CAUSAL 是「左上对齐」的上三角，BI-CAUSAL 是两者之交。`,
-            R`这套约定使得 \(s_q \ne s_k\) 时语义依然唯一：当 \(s_q < s_k\)，CAUSAL 切片是一个梯形；当 \(s_q > s_k\)，BI-CAUSAL 可能为空集。滑动窗口等「按行收缩」的 mask 用 FULL+CAUSAL+INV-CAUSAL 的组合即可紧凑表达，不需要逐行枚举。`,
-            R`任意 mask 的表达式：给定切片集合 \(\{(Q_i, K_i, T_i)\}\)，全局 mask \(M[q,k]=1\) 当且仅当存在 \(i\) 使 \(q\in Q_i,\ k\in K_i\)，且 \((q,k)\) 落在 \(T_i\) 的几何内。切片可以重叠——这正是需要「可累加输出」的原因。`
+            R`<code>AttnMaskType</code> 定义四种矩形内部的形状：<code>FULL</code> 全部有效；<code>CAUSAL</code> 保留下三角；<code>INVCAUSAL</code> 保留上三角；<code>BICAUSAL</code> 取上下三角的交集。这里的“右下对齐”表示 Q 和 K 的末尾对齐，“左上对齐”表示二者开头对齐。`,
+            R`设切片有 \(s_q\) 行 Q、\(s_k\) 列 K。若两者长度不同，对齐方向会改变三角形的位置。例如 \(s_q<s_k\) 时，右下对齐的 CAUSAL 区域会变成梯形。先明确长度和对齐方向，再看公式，就不会把它误认为普通的 \(k\le q\)。`,
+            R`全局 mask 就是所有切片有效位置的并集。切片允许重叠，因此同一 Q 行可能得到多份局部结果；这些结果需要在最后合并。`
           ],
           svg: "attnslice-masktypes",
-          formula: R`<p>以 CAUSAL 为例（右下对齐），切片内合法条件为</p>
-\[ k - k_{\mathrm{start}} \;\le\; (q - q_{\mathrm{start}}) + (s_k - s_q), \qquad s_q = |Q_i|,\; s_k = |K_i| . \]
-<p>INV-CAUSAL（左上对齐）为 \(k - k_{\mathrm{start}} \ge q - q_{\mathrm{start}}\)，BI-CAUSAL 取两式之交。四种类型都是「每行一个连续 K 区间」，区间端点随 \(q\) 线性移动——这是 kernel 能高效处理它们的根本原因。</p>`
+          formula: R`<p>先定义符号：\(q\) 和 \(k\) 是全局位置，\(q_{\mathrm{start}}\) 和 \(k_{\mathrm{start}}\) 是当前切片的起点；\(q'=q-q_{\mathrm{start}}\)、\(k'=k-k_{\mathrm{start}}\) 是切片内从 0 开始的相对位置；\(s_q\)、\(s_k\) 是切片内 Q、K 的长度。右下对齐的 CAUSAL 条件为</p>
+\[ k' \le q' + (s_k-s_q). \]
+<p>例：\(s_q=3,s_k=5\) 时，三行 Q 可看到的最大 K 下标依次为 2、3、4，正好让两者末尾对齐。INV-CAUSAL 为 \(k'\ge q'\)，BI-CAUSAL 同时满足两式。每行的有效 K 都是连续区间，因此 kernel 只需计算区间边界。</p>`
         },
         {
           title: "out / lse 的可累加语义",
           body: [
-            R`同一个 Q token 可能出现在多个切片（重叠 ranges）或多个 CP rank 的 partial attention 中，各处算出的是「局部 softmax」结果。要合并它们，kernel 必须输出两样东西：fp32 的 <code>out</code>（开 atomic reduction 时）和永远为 fp32 的 <code>lse</code>（log-sum-exp，空集初值 \(-\infty\)）。`,
+            R`同一个 Q token 可能在多个切片或多个 CP rank（序列并行进程）上分别计算。每处只得到局部 softmax。为了合并这些局部结果，需要同时保留输出 <code>out</code> 和归一化信息 <code>lse</code>。LSE 是 log-sum-exp，空集合记为 \(-\infty\)。`,
             R`functional 层的默认策略：只要 Q ranges 可能重叠，就把 <code>out_type</code> 设为 <code>torch.float32</code> 并用 atomicAdd 归约；调用方显式声明「Q 不重叠」（<code>disable_fwd_atomic_reduction=True</code>）才允许按输入 dtype 直写。CuTe DSL 路径当前因为 ranges 等价于 cu_seqlens（天然不重叠），直接按 <code>q.dtype</code> 写出。`,
             R`Block 03 展示了 cutedsl 侧的另一处契约细节：空输入时 <code>out.zero_()</code>、<code>lse.fill_(-inf)</code>——\(-\infty\) 正是「对空集合做 log-sum-exp」的正确单位元，保证后续合并公式无需特判。`
           ],
           formula: R`<p>两段 partial 结果的合并（<code>magi_attention/functional/utils.py</code>，<code>correct_attn_out_lse</code>）：</p>
 \[ \mathrm{lse} = \log\!\big(e^{\mathrm{lse}_1} + e^{\mathrm{lse}_2}\big) = \max(\mathrm{lse}_1,\mathrm{lse}_2) + \operatorname{softplus}\!\big(\min - \max\big), \]
 \[ w_i = e^{\mathrm{lse}_i - \mathrm{lse}}, \qquad \mathrm{out} = w_1\,\mathrm{out}_1 + w_2\,\mathrm{out}_2 . \]
-<p>由于 \(w_1 + w_2 = 1\) 且运算满足交换律与结合律，任意多段 partial attention 都能以任意顺序、任意分组合并——这就是「输出是半群」的精确含义，也是 MagiAttention 分布式 GroupReduce 的数学基础。</p>`
+<p>在实数运算中，这个合并满足交换律和结合律，空结果 \((0,-\infty)\) 还是单位元，因此任意多段都能分组归约。实际 fp32 会因加法顺序不同产生很小的舍入差异。</p>`
         },
         {
           title: "两套 FFA 栈：JIT 生产路径 vs CuTe DSL 路径",
           body: [
-            R`<strong>functional/JIT 路径</strong>（<code>magi_attention/functional/flex_flash_attn.py</code>，SM90 C++ kernel）：支持任意重叠 <code>q_ranges/k_ranges</code> + 每 range 独立的 <code>attn_type_map</code>（0/1/2/3）、<code>merge_ranges</code> 自动去重（产出 <code>merge_q_ranges / fwd_qk_map / fwd_unique_count</code>）、三个 atomic 开关、<code>sm_margin</code> 给通信 kernel 留 SM。这是 MagiAttention CP 训练的主力。`,
-            R`<strong>CuTe DSL 路径</strong>（本课程主角）：源码注释直言这是 "Step-1 hack"——<code>ranges_to_cu_seqlens</code> 要求 ranges 从 0 起、连续、不重叠；<code>MT_MAP</code> 只有 <code>full=0, causal=1</code>，<code>inv_causal/bi_causal</code> 留着 TODO。作为交换，它拿到了 SM90 JIT 没有的东西：原生 SM100 kernel、FlexAttention 风格的 <code>score_mod/mask_mod</code>、CSR 化的 block-sparse 表、PackGQA 与 PagedKV。`,
-            R`历史脉络：v1.1.0 时代 Blackwell 支持靠 <code>FFA_FA4</code> 后端——fork 的 Flash-Attention 4 加上 HSTU Function 表示（把每行的合法 K 区间编码为分段函数）。in-tree 的 cutedsl SM100 kernel 是替代它的原生方案，正在逐步长出完整 AttnSlice 语义。`
+            R`<strong>functional/JIT 路径</strong>支持重叠 ranges、四种 mask、自动去重和原子归约，是当前分布式训练主路径。`,
+            R`<strong>CuTe DSL 路径</strong>原生运行在 SM100，并支持 <code>score_mod/mask_mod</code>、块稀疏、PackGQA 和 PagedKV。但 <code>ranges_to_cu_seqlens</code> 仍要求 ranges 从 0 开始、连续且不重叠，mask 类型也只有 full/causal。`,
+            R`因此两条路径各有重点：前者语义更完整，后者展示 Blackwell 原生实现。不要把一条路径的能力直接套到另一条。`
           ]
         },
         {
           title: "host 侧一次前向的旅程",
           body: [
-            R`Block 04–07 串起完整决策链。<strong>mask 折叠</strong>：单一 <code>mask_type</code> 折叠成 <code>causal</code> 布尔量供启发式使用。<strong>tile 选择</strong>：SM100 固定 <code>tile_m = tile_n = 128</code>；<code>q_stage = 2</code>（当 \(s_q^{\mathrm{packgqa}} > 128\)）意味着一个 CTA 同时处理两个 128 行的 Q 子块。<strong>2-CTA 判定</strong>：非 causal、非 varlen、非稀疏、head_dim padded 到 128/192 且 head_dim_v=128、序列足够长时启用（第 1 章详解）。<strong>CLC 判定</strong>：varlen-MHA 与 dense-noncausal 场景实测回退，被 host 侧启发式排除（第 6 章详解）。`,
-            R`<strong>compile_key</strong> 是理解 CuTe DSL 工作方式的钥匙：dtype、head_dim、mask_type、tile、q_stage、pack_gqa、arch、2-CTA、CLC……所有会改变生成代码的量都进 key。同一 key 首次调用触发 <code>cute.compile(..., options="--enable-tvm-ffi")</code>，之后走缓存直接启动——tvm-ffi 消除了每次调用的 <code>from_dlpack</code> 元数据转换开销。这也解释了官方文档为何建议生产前预编译常见形状。`
+            R`host 先把 <code>mask_type</code> 转成简单的 <code>causal</code> 标志，再选择 tile、Q stage、是否让两个 CTA 协作，以及是否启用 CLC 调度。CTA 是一组协作线程；这里一个 Q stage 对应 128 行 Q。具体启用条件会在后续章节逐项解释。`,
+            R`<code>compile_key</code> 是编译缓存键。凡是会改变生成代码的配置，例如 dtype、head_dim、mask、tile 和调度模式，都必须放进 key。某个 key 第一次出现时编译，之后直接复用缓存。`
           ]
         }
       ],
-      warning: R`不要把「FFA 支持四种 mask 类型」理解为「Blackwell kernel 内部有四个分支」。当前 CuTe DSL kernel 只认 full/causal 两个整数；INV/BI-CAUSAL 由上层切片分解或 SM90 JIT 路径承接。引用能力表时务必注明是哪条栈。`,
+      warning: R`“FFA 支持四种 mask”说的是整体接口，不等于 SM100 CuTe DSL kernel 已原生实现四种分支。当前该 kernel 只识别 full/causal；引用能力时请注明实现路径。`,
       exercises: [
         {
           kind: "概念", level: "基础",
@@ -92,7 +92,7 @@
           kind: "推导", level: "进阶",
           q: R`证明 LSE 合并公式的数值安全性：为什么实现写成 \(\max + \operatorname{softplus}(\min-\max)\) 而不是直接 \(\log(e^{l_1}+e^{l_2})\)？当 \(l_1 = -\infty\) 时会发生什么？`,
           hint: R`考虑 \(l_i \approx 80\)（bf16 训练常见量级）时 \(e^{l_i}\) 的表示范围，以及 softplus 在 \(-\infty\) 处的取值。`,
-          answer: R`\(e^{80}\approx 5.5\times10^{34}\) 已超出 fp32 上限（\(\sim3.4\times10^{38}\) 边缘），双段相加更容易溢出。改写后指数项恒为 \(e^{\min-\max}\le 1\)，绝不溢出。当 \(l_1=-\infty\)（空集）时 \(\operatorname{softplus}(-\infty)=0\)，公式退化为 \(\mathrm{lse}=l_2\)，即空集是合并的单位元——源码里 <code>safe_subtract</code> 专门保证 \(-\infty - (-\infty)\) 不产生 NaN。`
+          answer: R`\(e^{80}\approx 5.5\times10^{34}\) 在 fp32 中仍可表示，但 fp32 的自然指数约在 \(x>88.7\) 时上溢，因此直接计算依赖 LSE 的绝对大小。改写后唯一的指数项满足 \(e^{\min-\max}\le 1\)，不会上溢。当 \(l_1=-\infty\) 时，公式退化为 \(\mathrm{lse}=l_2\)，说明空集是合并单位元。源码中的 <code>safe_subtract</code> 还避免了 \(-\infty-(-\infty)\) 产生 NaN。`
         },
         {
           kind: "推导", level: "进阶",
@@ -141,17 +141,17 @@
       category: "sparse",
       difficulty: "进阶",
       source: "kernel/cutedsl/ffa_fwd_sm100.py · __init__/__call__",
-      deck: R`Hopper 的注意力 kernel 把累加器放在寄存器堆里；Blackwell 把它搬进了一块全新的片上存储 <strong>TMEM（Tensor Memory）</strong>，由 <strong>tcgen05</strong>（第五代 Tensor Core，俗称 UMMA）直接读写。理解 TMEM 的 512 列地图、单 warp 发射的 MMA、以及 TMA 的字节计账，是读懂整个 kernel 的前提。`,
-      takeaway: R`Blackwell 给矩阵计算加了「第三层片上存储」：SMEM 喂数据，<strong>TMEM 存累加器</strong>（每 CTA 128 行 × 512 列 × 4B），tcgen05 MMA 由<strong>单个 warp 异步发射</strong>、完成靠 mbarrier 通知。于是「算」不再占用任何计算 warp 的寄存器——寄存器全部让给 softmax。FFA 把 S、P、O 全部塞进这 512 列，其中 <strong>P 直接叠放在 S 的空间上</strong>（bf16 只占 fp32 一半宽）。`,
+      deck: R`本章先建立三个硬件概念。<strong>SMEM</strong> 是线程块共享的片上存储；<strong>TMEM</strong> 是 Blackwell 专门存放矩阵乘累加结果的新空间；<strong>TMA</strong> 是负责在全局内存与 SMEM 之间搬运数据的硬件引擎。第五代 Tensor Core 指令 <strong>tcgen05</strong>（也常称 UMMA）直接读写 TMEM。`,
+      takeaway: R`记住一条数据路线即可：TMA 把 Q/K/V 搬到 SMEM，tcgen05 完成矩阵乘并把结果累加到 TMEM，softmax 再通过专用指令读写 TMEM。这样，矩阵乘的累加器不再占普通寄存器，softmax 可以获得更多寄存器。`,
       intuitions: [
-        { label: "存储", title: "TMEM 是累加器的家", body: R`\(S = QK^\top\) 与 \(O = PV\) 的 fp32 累加器都住在 TMEM,MMA 写、T2R 读、R2T 改,不经过寄存器堆分配。` },
-        { label: "计算", title: "MMA 只需一个 warp", body: "tcgen05 指令单线程发射、异步执行,一个 warp 就能喂满两个 CTA 的 Tensor Core;其余 15 个 warp 干别的。" },
-        { label: "搬运", title: "TMA 按字节记账", body: R`bulk tensor copy 由硬件搬运,producer 只声明 tx_count 字节数,mbarrier 在数据到齐时自动翻转。` }
+        { label: "存储", title: "TMEM 专门存累加结果", body: R`分数 \(S=QK^\top\) 和输出 \(O=PV\) 的 fp32 累加器都放在 TMEM。T2R 表示 TMEM→寄存器，R2T 表示寄存器→TMEM。` },
+        { label: "计算", title: "一个 warp 负责发射 MMA", body: "tcgen05 由一个线程发出后异步执行。负责发射的 warp 不必一直等待，其他 warp 可同时做 softmax、搬运和收尾。" },
+        { label: "搬运", title: "TMA 用字节数判断完成", body: R`producer（发起搬运的一方）预先登记本次应到达的字节数。TMA 搬完后更新 mbarrier，consumer 才开始读取。` }
       ],
       motivation: [
-        R`FlashAttention-3 在 Hopper 上的核心矛盾：WGMMA 的累加器占用寄存器,softmax 也要寄存器,两者互相挤压,只能靠 warpgroup 间乒乓调度缓解。Blackwell 的答案是架构级的：给累加器单独建一块存储（TMEM）,让 MMA 从「occupying-register 的集体操作」变成「单线程发射的异步引擎」。`,
-        R`代价是显式管理:TMEM 只有 512 列（每列 128 行 × 32bit）,分配/释放要走 <code>tcgen05.alloc</code> 专用指令,读写要用专门的 T2R/R2T copy 原子,跨 warp 可见性要靠 <code>fence_view_async_tmem_*</code>。FFA 前向把这 512 列规划得严丝合缝——本章 Block 02 的 20 行代码就是整个 kernel 的「内存地图」。`,
-        R`2-CTA 模式（<code>use_2cta_instrs</code>）再翻一倍:两个 CTA 组成 cluster,tcgen05 以 <code>CtaGroup.TWO</code> 发射,一次 MMA 覆盖 256 行,K/V 的 SMEM 各存一半、互相通过 DSMEM 读取。host 侧的启用条件（非 causal、非 varlen、head_dim ∈ {128,192}、序列够长）本质上都在回答一个问题:两个 CTA 的负载是否天然对称。`
+        R`在 Hopper 上，矩阵乘累加器和 softmax 都占寄存器，两者会争抢容量。Blackwell 把累加器移到 TMEM，缓解了这项冲突。`,
+        R`TMEM 不是普通内存：它只有 512 列，必须显式分配和释放，也只能通过 tcgen05、T2R、R2T 等专用指令访问。因此 kernel 需要先画好每一列何时存 S、P 或 O。`,
+        R`可选的 2-CTA 模式让两个 CTA（线程块）组成 cluster，共同处理 256 行 Q。两个 CTA 分摊 K/V 数据，并通过分布式 SMEM 互相读取。只有两边工作量接近时，这种协作才划算。`
       ],
       diagram: {
         key: "blackwell",
@@ -161,18 +161,18 @@
         {
           title: "TMEM 512 列地图",
           body: [
-            R`Block 02 的规划（tileK=128、head_dim_v=128、q_stage=2 时）：S0 占列 [0,128)、S1 占 [128,256)、O0 占 [256,384)、O1 占 [384,512)，总共恰好 512 列。每个「列」是 128 行 × 32bit，正好对应 MMA tile 的一列 fp32 累加。`,
-            R`最精巧的是 P 的安置：softmax 产出的 P 是 bf16，宽度只有 fp32 一半，所以 <code>tmem_p_offset = tmem_s_offset + 64</code>——P0 以 bf16 视图叠放在 S0 的后半空间 [64,192)。这不是巧合而是时序保证：softmax 先把 S 整块读进寄存器（T2R），再把 exp2 后的 P 写回（R2T），读写天然错开。row_max/row_sum 的向量缓冲同样复用 S 的空间（softmax 之后 S 不再被需要）。`,
-            R`这张地图直接决定了第 2 章的流水线结构：S 槽位的「满/空」就是 MMA 与 softmax 之间的接力棒，O 槽位的「rescale 完成」就是 MMA 与 correction 之间的接力棒。`
+            R`以 tileK=128、head_dim_v=128、q_stage=2 为例：S0、S1、O0、O1 各占 128 列，正好用完 512 列。S0/S1 是两组 Q 的分数，O0/O1 是对应输出。`,
+            R`P 不需要额外 128 列。softmax 先把 S 读入寄存器，S 在 TMEM 中随即可以复用；随后 P 以 bf16 写回。bf16 每个元素占 fp32 的一半，因此 P 只占一半物理宽度。row_max 和 row_sum 也在 S 不再使用后复用其空间。`,
+            R`后续流水线只需要维护这些槽位的状态：S 写完后通知 softmax，O 校准完后通知下一次矩阵乘。`
           ],
           svg: "tmem-map"
         },
         {
           title: "tcgen05 UMMA：两个 GEMM、一种发射方式",
           body: [
-            R`Block 03 用 <code>make_trivial_tiled_mma</code> 构造两个 TiledMMA：QK GEMM 的 A/B 都来自 SMEM；PV GEMM 的 A（即 P）声明 <code>OperandSource.TMEM</code>——tcgen05 可以直接从 TMEM 读 A 操作数，P 根本不用去 SMEM 绕一圈。注释里的 MMA Atom 形状 <code>(256,128,16)</code> 是 2-CTA 模式：ThrID 2:1 表示两个 CTA 各贡献一半。`,
-            R`发射模型与 Hopper 截然不同：WGMMA 需要整个 warpgroup（128 线程）同步参与;tcgen05 由 MMA warp 中<strong>被选举的单个线程</strong>发射,指令进入异步队列,完成事件写到指定 mbarrier。这就是第 2 章「1 个 MMA warp 服务 15 个其他 warp」的硬件基础。`,
-            R`2-CTA 下只有 leader CTA（cluster 内 rank 0）发射 UMMA,peer CTA 的 SMEM 通过 cluster 的分布式共享内存被读取;两个 CTA 各自拿到自己 128 行的累加结果。`
+            R`kernel 有两个矩阵乘：QK 计算分数 S，PV 累加输出 O。QK 的输入来自 SMEM；PV 的 P 直接来自 TMEM，因此不需要先复制回 SMEM。`,
+            R`tcgen05 指令由 MMA warp 中一个被选中的线程发射，随后异步执行，并在完成时更新 mbarrier。warpgroup 指 4 个 warp、共 128 个线程；与需要整个 warpgroup 参与的 Hopper WGMMA 相比，Blackwell 的发射端更轻。`,
+            R`在 2-CTA 模式下，只有 leader CTA 发射指令，但硬件会读取两个 CTA 的 SMEM。两个 CTA 最终各得到自己的 128 行结果。`
           ],
           formula: R`<p>一个 Q tile（q_stage=2 展开前的单 stage）在 TMEM 里完成的计算：</p>
 \[ \underbrace{S_i}_{\mathrm{TMEM}[0,128)} = \underbrace{Q_i}_{\mathrm{SMEM}} \underbrace{K_j^{\mathsf T}}_{\mathrm{SMEM}}, \qquad \underbrace{O_i}_{\mathrm{TMEM}[256,384)} \mathrel{+}= \underbrace{P_{ij}}_{\mathrm{TMEM}[64,192)} \underbrace{V_j}_{\mathrm{SMEM}} . \]
@@ -181,20 +181,20 @@
         {
           title: "TMA：搬运即记账",
           body: [
-            R`Block 05 为 Q/K/V 各建一个 G2S TMA atom（<code>CopyBulkTensorTileG2SOp(cta_group)</code>），为 O 建一个 S2G atom。TMA 是描述符驱动的硬件引擎：kernel 里一条指令声明「把第 (i,j) 个 tile 搬到这个 SMEM 地址」，地址计算、边界裁剪、swizzle 全部由硬件完成。`,
-            R`与流水线的接口是「事务字节数」：<code>tma_copy_bytes["K"]</code> 在 host 侧静态算出（Block 04 的 smem layout 尺寸 × cta_group_size），producer 发起 TMA 时把它挂到 mbarrier 上，硬件每搬到一批字节就向 mbarrier 记账，字节数到齐 barrier 自动翻转——消费者（MMA warp）看到的就是「sK[stage] 满了」。`,
-            R`注意 K 与 V 复用同一块物理 SMEM（Block 04 里 <code>sV</code> 用 <code>recast_ptr</code> 指向 <code>sK</code> 的空间加偏移）,配合 kv_stage 环形缓冲：SMEM 预算 = 224KB 总量减去 Q/O 占用,除以单 stage 的 max(K,V) 尺寸,得出能开几级流水。`
+            R`TMA 的任务是批量搬运 tile。G2S 表示全局内存到 SMEM，S2G 表示反方向。地址计算、边界裁剪和布局转换由硬件描述符完成。`,
+            R`发起搬运前，producer 把预期字节数登记到 mbarrier。TMA 完成对应字节后，barrier 才变为“就绪”，MMA warp 因而知道某个 K/V 槽位可以读取。`,
+            R`K 和 V 在不同时间复用同一块 SMEM，并使用多个 stage 组成环形缓冲。可用 stage 数由 224KB SMEM 预算除以单个 K/V stage 的大小得到。`
           ]
         },
         {
           title: "TMEM 的生命周期管理",
           body: [
-            R`Block 07：只有 MMA warp 执行 <code>tmem.allocate(512)</code>。分配结果（基地址）写到 SMEM 的约定位置,其他 warp 通过 <code>TmemPtr</code> named barrier 等待后 retrieve。释放更讲究:softmax 和 correction warp 完成各自最后一次 TMEM 访问后 arrive 同一个 barrier,MMA warp 等齐三方才敢 <code>dealloc</code>——否则会出现「一边释放一边还有 warp 在读」的竞态。`,
-            R`这个模式值得记住:TMEM 没有自动生命周期,任何「谁分配、谁使用、谁见证释放」都要用 barrier 显式编排。第 2 章的 <code>tmem_alloc_barrier</code>（线程数 = mma + softmax×2 + correction 的总线程数）就是这套约定的实现。`
+            R`只有 MMA warp 分配 TMEM，并把基地址写到 SMEM；其他 warp 等待 barrier 后再取这个地址。`,
+            R`释放前，softmax、correction 和 MMA 三方都必须确认最后一次访问已结束。TMEM 没有自动生命周期，少一次同步就可能在仍有线程读写时提前释放。`
           ]
         }
       ],
-      warning: R`TMEM 不是「更大的寄存器堆」也不是「另一块 SMEM」：它只能被 tcgen05 MMA 和专用 T2R/R2T copy 指令访问，普通 load/store 碰不到它；每 CTA 至多 512 列，且分配必须整块进行。把它理解为「Tensor Core 的专属累加器仓库」最不容易出错。`,
+      warning: R`TMEM 不能用普通 load/store 访问，也不能当作更大的 SMEM。把它理解成“Tensor Core 专用的累加器仓库”最准确。`,
       exercises: [
         {
           kind: "计算", level: "基础",
@@ -255,17 +255,17 @@
       category: "hybrid",
       difficulty: "进阶",
       source: "kernel/cutedsl/ffa_fwd_sm100.py · kernel()",
-      deck: R`一个 CTA 的 512 个线程被切成 7 种角色：8 个 softmax warp、4 个 correction warp、1 个 MMA warp、1 个 load warp、1 个 epilogue warp、1 个 empty/CLC warp。它们共享一份 kernel 代码，靠 <code>warp_idx</code> 分流，用六条 mbarrier 流水线和一组 named barrier 接力。这是整个前向 kernel 的骨架。`,
-      takeaway: R`Warp specialization 的本质是<strong>把寄存器和延迟按角色重新分配</strong>：softmax 是唯一的重计算角色，独享 176–192 个寄存器/线程；load/MMA/epilogue 是「发射即忘」的异步引擎驱动者，只留 48–80 个。角色之间不共享数据结构，只交换<strong>槽位的满/空状态</strong>——其中最精妙的一条流水线 <code>pipeline_s_p_o</code> 让同一个 mbarrier 槽位track 两种语义转移：S-full（MMA→softmax）与 P+O-empty（softmax+correction→MMA）。`,
+      deck: R`一个 CTA 有 512 个线程，也就是 16 个 warp。kernel 不让所有 warp 做同一件事，而是把它们分成搬运、矩阵乘、softmax、校准和写回等角色。每个角色反复处理自己的步骤，并通过 barrier 交接数据槽位。`,
+      takeaway: R`Warp specialization 就是“固定分工”。softmax 需要大量寄存器，因此分得最多；load、MMA 和写回 warp 主要负责发起异步指令，只需较少寄存器。各角色不传递复杂对象，只约定某个 SMEM/TMEM 槽位何时“满”或“空”。`,
       intuitions: [
         { label: "分工", title: "流水线工厂", body: "load 进料、MMA 冲压、softmax 精加工、correction 校准、epilogue 打包出货——每个工位只做一件事,靠传送带（mbarrier）衔接。" },
-        { label: "资源", title: "512 寄存器的账本", body: R`\(512 = 2\times\text{softmax} + \text{correction} + \text{other}\)。setmaxregister 在运行时把寄存器从闲角色转移给 softmax。` },
-        { label: "同步", title: "满/空是唯一语言", body: "warp 之间不传数据指针,只翻转 mbarrier 相位;数据永远在约定好的 TMEM/SMEM 槽位里。" }
+        { label: "资源", title: "按角色分配寄存器", body: R`代码用 512 作为四类角色的配额账本：两组 softmax、correction 和 other。<code>setmaxregister</code> 让轻量角色降低上限，把额度留给 softmax。` },
+        { label: "同步", title: "只交接槽位状态", body: "数据始终放在约定的 TMEM/SMEM 地址。warp 只通过 mbarrier 告知对方“可以读”或“可以覆盖”。" }
       ],
       motivation: [
-        R`FlashAttention-3 在 Hopper 上确立了「producer/consumer warpgroup」范式;SM100 把它推到极致:MMA 不再消耗任何 warpgroup 的寄存器（tcgen05 单线程发射）,于是角色可以切得更碎、更专。FFA 前向的 16 个 warp 里,真正「算数」的只有 softmax 的 8 个;其余 8 个全在编排数据流。`,
-        R`角色表不是固定的（Block 01 后半）:q_stage=1 时 softmax1 整组让位;paged KV 非 TMA 时 load 扩成 2 个 warp;varlen 时 correction 兼任 epilogue,原 epilogue warp 变 empty。这种「按配置重排角色」是用一份代码覆盖多种形态的关键——所有分支都是 <code>const_expr</code> 编译期决议,运行时零开销。`,
-        R`本章聚焦一条主线:一个 KV block 从 TMA 进 SMEM,到 S 进 TMEM,到 P 回 TMEM,到 O 累加、被 rescale,数据每换一次主人,靠哪条流水线交接。`
+        R`producer 是写入槽位的一方，consumer 是读取并释放槽位的一方。SM100 的 MMA 只需轻量发射，因此可以把更多 warp 留给 softmax 和数据流编排。`,
+        R`角色数量会随配置变化。例如只有一个 Q stage 时，不需要第二组 softmax；变长序列写回时，correction warp 会兼任 epilogue。由于这些选择在编译期确定，运行时不会为未选路径付分支开销。`,
+        R`阅读本章只追踪一个 KV block：TMA 把它搬进 SMEM，MMA 生成 S，softmax 生成 P，下一次 MMA 累加 O，correction 再校准旧 O。每次交接都对应一条流水线。`
       ],
       diagram: {
         key: "pipeline",
@@ -275,43 +275,43 @@
         {
           title: "角色表与寄存器账本",
           body: [
-            R`默认布局（Block 01）:warp 0–3 = softmax0（服务 Q-stage 0）,warp 4–7 = softmax1（Q-stage 1）,warp 8–11 = correction,warp 12 = MMA,warp 13 = epilogue,warp 14 = load,warp 15 = empty（CLC 开启时兼任调度 producer）。`,
-            R`寄存器账本（Block 02）:SM100 每线程静态上限 512 个寄存器（按 warpgroup 记账）。kernel 启动后,load/MMA/epilogue/empty 立刻 <code>setmaxregister_decrease(num_regs_other)</code>（如 48–80）,softmax 随后 <code>increase(176–192)</code>,correction 取中间值 64–88。调参表 <code>_TUNING_CONFIG</code> 按 (2CTA, causal, head_dim, SM103) 精确到每 8 个寄存器——softmax 的寄存器直接决定它一次能驻留多少 S 元素,是全 kernel 最敏感的资源。`,
+            R`默认分工是：warp 0–7 做两组 softmax，8–11 做 correction，12 发射 MMA，13 写回，14 搬运，15 空闲或负责 CLC 调度。4 个连续 warp 称为一个 warpgroup。`,
+            R`寄存器按 warpgroup 重新分配。load/MMA/epilogue 主动降低上限，softmax 再提高上限，correction 取中间值。softmax 的额度决定一次能在寄存器里保留多少分数，因此是最敏感的调参项。`,
             R`一个容易忽略的细节:降寄存器的角色必须先降、升寄存器的角色后升,否则瞬时总量超限。源码里 empty/load/MMA/epilogue 的 decrease 都写在各自分支的第一行。`
           ]
         },
         {
           title: "六条流水线的全景",
           body: [
-            R`<strong>pipeline_q / pipeline_kv</strong>（Block 03,TMA→UMMA 型）:load warp 是 producer,靠 TMA 硬件对 mbarrier 记账（tx_count 字节）;MMA warp 是 consumer。Q 有 q_stage 个槽位,KV 的槽位数由 SMEM 预算决定（通常 3–8 级）,K 和 V 交替占用。`,
-            R`<strong>pipeline_s_p_o</strong>（Block 04,UMMA→Async 型）:全 kernel 最核心的一条。producer 是 MMA warp:QK GEMM 完成即 commit（S-full）;consumer 是 softmax+correction 的<strong>联合体</strong>——同一槽位要等 softmax（P 已写回）和 correction（O 已 rescale）双双 release,MMA 才能发下一次 PV GEMM。把两种完成事件编进一个 barrier,是「一个槽位、双重语义」的经典设计。`,
-            R`<strong>pipeline_p_lastsplit</strong>:配合 split_P_arrive 优化（见第 4 节）。<strong>pipeline_o_acc</strong>（Block 05）:只在每个 Q tile 的最后一个 KV block 使用——主循环里 correction 无需等 O（GEMM 顺序保证了 O(i-1) 先于 S(i) 完成）,唯独尾声这个保证断裂,才需要显式流水线。<strong>pipeline_sm_stats + sm_stats_barrier</strong>（Block 06）:保护 sScale 槽位的一对 WAR/RAW 拍档,细节留给第 5 章。`
+            R`<strong>pipeline_q / pipeline_kv</strong> 管 SMEM 输入槽位。load warp 发起 TMA，MMA warp 等字节全部到达后读取。多个 stage 让搬运与计算重叠。`,
+            R`<strong>pipeline_s_p_o</strong> 管 TMEM 中的 S、P 和 O。QK 完成表示 S 可读；下一次 PV 开始前，又必须同时满足 P 已写完、旧 O 已校准。一个槽位因此有两项释放条件。`,
+            R`其余流水线只处理特殊等待：<code>pipeline_p_lastsplit</code> 通知 P 的最后一段已写完；<code>pipeline_o_acc</code> 等最后一次 O 累加；<code>pipeline_sm_stats</code> 与 named barrier 共同保护 softmax 和 correction 共享的缩放值。`
           ],
           svg: "pipeline-wave"
         },
         {
           title: "一个 KV block 的完整旅程",
           body: [
-            R`把六条流水线串起来,追踪 KV block j 在 Q-stage i 上的一生:① load warp acquire <code>pipeline_kv</code> 空槽 → 发 TMA → 硬件记账至满;② MMA warp 等 K 满 → 发 QK UMMA（写 TMEM S_i）→ commit <code>pipeline_s_p_o</code>(S-full);③ softmax_i warpgroup 等 S-full → T2R → mask/row_max/exp2 → R2T 写 P → release(P 侧);④ 同时 correction 读到 corr_scale 后 rescale O_i(j-1) → release(O 侧);⑤ MMA 集齐双 release → 发 PV UMMA(P_i × V_j 累加进 O_i) → release <code>pipeline_kv</code> 的 V 槽;⑥ load warp 见空槽,继续搬 j+2 的 K。`,
-            R`注意其中没有任何一步「等待计算」:每个角色只等槽位状态,计算本身全部异步。当 KV 足够长时,TMA 搬运、两个 GEMM、softmax、correction 五者完全重叠——这正是把 mask/调度做对之后,SM100 能接近 Tensor Core 峰值的原因。`
+            R`一个 KV block 依次经历：① load warp 找到空槽并发起 TMA；② K 到齐后，MMA 计算 QK 并写 S；③ softmax 读取 S、应用 mask、计算 P；④ correction 同时校准上一轮 O；⑤ P 和 O 都就绪后，MMA 计算 PV；⑥ V 槽释放，供下一轮搬运复用。`,
+            R`不同角色处理的是不同轮次的数据。例如 load 可能在搬第 \(j+2\) 块，softmax 正处理第 \(j\) 块，correction 在修正第 \(j-1\) 块。KV 足够长时，这些工作可以重叠。`
           ]
         },
         {
           title: "split_P_arrive：P 写一半就开跑",
           body: [
-            R`softmax 把 128 列 P 写回 TMEM 需要多次 R2T copy。<code>split_P_arrive = 96</code>（tileK 的 3/4,取 32 倍数）时,softmax 写完前 96 列就提前 release <code>pipeline_s_p_o</code>,MMA 立即发射 PV GEMM;GEMM 硬件读到 96 列之后,需要等 <code>pipeline_p_lastsplit</code> 的信号才读最后 32 列——这个信号由 softmax 写完全部 P 后 commit。`,
-            R`效果是把「写 P 的尾巴」藏进「PV GEMM 的头部」。这是一个典型的 Blackwell 式优化:因为 GEMM 是硬件异步引擎,可以让它先启动、在中途等一个 mbarrier,软件流水线因此能切得比指令粒度还细。`
+            R`写回 128 列 P 需要多条 R2T 指令。写完前 96 列时，softmax 先通知 MMA 启动 PV；写完最后 32 列后，再发送第二个信号。MMA 读到尾部前若数据未就绪，会在硬件中等待。`,
+            R`这样，P 尾部的写回与 PV 开头的计算重叠，缩短了两步之间的串行时间。`
           ]
         },
         {
           title: "s0_s1_barrier：两组 softmax 的写口错峰",
           body: [
-            R`q_stage=2 时两组 softmax warpgroup 分别服务 S0/S1,它们的 exp2+R2T 阶段会争抢同一个 TMEM 写口带宽。<code>s0_s1_barrier</code> 开启时,用一条 2-stage 的 pipeline 强制两组的「exp2→写 P」区段互相串行（各自的其余阶段仍并行）,把写口冲突变成交替占用。`,
-            R`加上 correction 对 <code>pipeline_sm_stats</code> 的 cross-release（第 5 章详解）,整个 kernel 呈现出一种「宏观并行、微观错峰」的节奏:两组 softmax 相位相差半个 KV block,correction 恰好插在两者的空隙里。`
+            R`两组 softmax 同时写 P 会争用 TMEM 写入带宽。<code>s0_s1_barrier</code> 只把两组的“exp2 后写 P”阶段错开，其他阶段仍可并行。`,
+            R`correction 的 cross-release 进一步让两组 softmax 相差约半个 KV block：一组写 P 时，另一组让出写口，correction 在两者之间工作。`
           ]
         }
       ],
-      warning: R`不要把 named barrier 与 pipeline 混为一谈：pipeline（mbarrier）管理「槽位的满/空 + 相位翻转」，适合跨迭代的环形缓冲；named barrier 是「一组线程到齐即放行」的会合点，无相位概念。sScale 同时需要两者（RAW 用 barrier、WAR 用 pipeline），正是因为它一个槽位上有两种不同生命周期的冒险。`,
+      warning: R`pipeline 负责跨多轮复用的“槽位满/空”；named barrier 只负责“这些线程本轮是否都到齐”。两者用途不同。sScale 同时使用两者，是因为既要保证写完才能读（RAW），又要保证读完才能覆盖（WAR）。`,
       exercises: [
         {
           kind: "计算", level: "基础",
@@ -367,22 +367,22 @@
       order: 3,
       title: "块级 Mask",
       fullTitle: "Block-level Masking",
-      zhTitle: "三层防线消化任意几何",
+      zhTitle: "Mask 如何分三层处理",
       tag: "SM100 · mask",
       category: "dense",
       difficulty: "进阶",
       source: "kernel/cutedsl/mask.py + block_info.py",
-      deck: R`mask 处理的代价结构是分层的：整块跳过（免费）≫ 整块无 mask（近免费）≫ 位掩码 R2P（便宜）≫ 逐元素谓词（昂贵）。FFA 用 BlockInfo 做粗粒度跳块、用三段主循环把 partial 块限制在几何边界上、用 R2P 把边界块的掩码压成位运算——mask 的开销从此不再随 \(n_{\mathrm{func}}\) 线性爆炸。`,
-      takeaway: R`一条端对齐不等式统治一切：\(k \le q + (s_k - s_q)\)。它在 <strong>BlockInfo</strong> 里被抬升到块坐标（决定哪些 n_block 根本不迭代），在 <strong>softmax_loop</strong> 里把 KV 迭代切成 partial→full→partial 三段（只有边界段付 mask 钱），在 <strong>AttentionMask</strong> 里被翻译成每行的 <code>col_limit</code> 并经 <strong>R2P</strong> 一次性写成 32 位掩码。同一几何、三个粒度、一处定义。`,
+      deck: R`mask 越早处理，代价越低。最便宜的是整块跳过；其次是确认整块都有效；只有边界块才需要逐行判断。FFA 因此分三层处理：BlockInfo 跳过无效块，主循环区分完整块和边界块，R2P 再处理边界块内的具体元素。`,
+      takeaway: R`先定义公式中的符号：\(q\) 是当前切片内的 Q 行号，\(k\) 是 K 列号，二者都从 0 开始；\(s_q\) 和 \(s_k\) 分别是 Q、K 的长度。右下对齐的 causal 条件是 \(k\le q+(s_k-s_q)\)。它的含义很直观：Q 与 K 的末尾对齐，每一行只能看见自己及其左侧位置。`,
       intuitions: [
         { label: "分层", title: "先跳块，再挑块，最后改元素", body: "能不算就不算（跳块），能整块算就别逐元素判（full 段），必须判时用位掩码批量判（R2P）。" },
-        { label: "几何", title: "一条不等式三处使用", body: R`端对齐 causal 的列界 \(k \le q + (s_k - s_q)\) 同时驱动跳块、分段与写 \(-\infty\)，不会「跳过头」也不会「漏 mask」。` },
+        { label: "几何", title: "先看一个具体例子", body: R`若 \(s_q=3,s_k=5\)，三行 Q 的最大合法 K 下标是 2、3、4。公式中的偏移 \(s_k-s_q=2\) 正是右下对齐产生的水平位移。` },
         { label: "开销", title: "mask 不该出现在快路径", body: "full 段的 softmax_step 根本不传 mask_fn——编译期就没有 mask 代码，这才是块级稀疏的意义。" }
       ],
       motivation: [
-        R`朴素做法是每个元素都判一次 mask——FA4 博客给过量化：flex mask 逐元素检查需要约 \(128\times n_{\mathrm{func}}\) 条比较指令/块，softmax warp 的延迟甚至会超过两个 GEMM 之和。mask 一旦进入内层循环，就是纯粹的税。`,
-        R`FFA 的策略是把 mask 从「内层判断」改造成「外层几何」：causal/local 的合法区边界是行号的线性函数，因此(1)整块合法/整块非法可以用块角点判定；(2)部分合法的块只出现在边界带上，数量是 \(O(\text{tile 对角带宽})\) 而非 \(O(n^2)\)。`,
-        R`剩下必须逐块处理的边界块，SM100 路径用 <strong>R2P（register-to-predicate）</strong>收尾：把 32 列的 keep/drop 打进一个 uint32，硬件 R2P 指令一次把 32 个位散到 32 个谓词寄存器，SEL 指令按谓词选择 \(-\infty\)。比较指令数从 \(O(128\, n_{\mathrm{func}})\) 降到 \(O(\lceil 128/32\rceil)\) 次位运算。`
+        R`最直接的做法是对 128×128 tile 中每个元素检查一次 mask，但多数元素通常位于完全有效或完全无效的块中，这些比较是浪费。`,
+        R`causal 和滑动窗口 mask 的边界随行号线性移动。因此只看一个 tile 的角点，就能判断它是全有效、全无效，还是边界穿过的 partial 块。只有第三类需要细查。`,
+        R`partial 块使用 <strong>R2P（register-to-predicate，寄存器位到谓词）</strong>。代码先把连续 32 列的保留/丢弃结果编码进一个 uint32，再一次转换成 32 个谓词，最后把无效分数写成 \(-\infty\)。`
       ],
       diagram: {
         key: "mask",
@@ -392,27 +392,27 @@
         {
           title: "第一层：BlockInfo 跳块",
           body: [
-            R`Block 01 的 <code>get_n_block_min_max</code>：对 Q tile \([m\cdot128, (m{+}1)\cdot128)\)，用 tile 内<strong>最大行号</strong>代入端对齐不等式得到 \(n_{\mathrm{idx}} = m_{\mathrm{idx}}^{\max} + (s_k - s_q)\)，向上取整除以 tile_n 就是 <code>n_block_max</code>——之后的 KV block 整块非法，循环压根不迭代。local mask 的左窗对称地给出 <code>n_block_min</code>。`,
-            R`注意所有坐标都是「切片内相对坐标」：<code>seqlen_q/k</code> 来自 <code>SeqlenInfoQK</code>（每 tile 开头读一次 cu_seqlens 缓存所有长度/offset），mask 比较用相对索引，gmem 寻址用 offset——两套坐标由同一个数据结构对齐，这是 varlen 正确性的基石。`,
+            R`先看右边界。一个 Q tile 覆盖 128 行；把其中最大的 Q 行号代入 causal 公式，就能得到该 tile 可能访问到的最大 K 列。再除以 128，便得到最后一个需要迭代的 K block。更右侧的 block 一定全无效，循环不会进入。滑动窗口的左边界用同样方法得到第一个 K block。`,
+            R`这里比较 mask 时使用<strong>切片内相对坐标</strong>，即 Q 和 K 都从各自切片的 0 开始。真正访问全局内存时才加上切片起点 offset。<code>SeqlenInfoQK</code> 同时保存长度和 offset，避免混用两套坐标。`,
             R`反向有对称的 <code>get_m_block_min_max</code>（固定 n_block 反推 Q 范围），第 7 章会用到。`
           ]
         },
         {
           title: "第二层：三段主循环",
           body: [
-            R`Block 02 是 softmax_loop 的骨架。以 causal 为例：<code>get_n_block_min_causal_local_mask</code> 算出「对角带」的起点——从 n_block_max 往回数，只有落在对角带内的块才可能 partial。于是循环切成：<strong>Mainloop-1</strong>（对角带，带 <code>mask_fn</code>，从右往左）→ <strong>Mainloop-2</strong>（full 区，不传 mask_fn，编译出的 softmax_step 里没有任何 mask 代码）→ <strong>Mainloop-3</strong>（仅 local mask 的左窗带，再带 mask_fn）。`,
-            R`prologue 单独处理最右一块并带 <code>mask_seqlen=True</code>：序列尾部的 OOB 列（\(k \ge s_k\)）只可能出现在最后一个 KV block，其余块连 seqlen 检查都省了。这种「把检查压到唯一可能出错的块」的手法贯穿全 kernel。`,
-            R`对照第 0 章：这正是 FFA_FA4 博客里 Full/Partial/Empty 三分类的原生版——Empty 被 BlockInfo 消灭，Full 走 Mainloop-2，Partial 走 1/3 段。block-sparse 路径则由外部 CSR 表直接给出 full/partial 块清单（Block 06 的 mask_mod 分支配合 <code>is_full_block</code>）。`
+            R`主循环按 K block 分成三段：右边界附近的 partial 段、完全有效的 full 段，以及滑动窗口才有的左边界 partial 段。partial 段调用 <code>mask_fn</code>，full 段在编译期完全移除 mask 代码。`,
+            R`最右侧 block 还可能越过实际序列长度，即 \(k\ge s_k\)。因此 prologue 单独检查这一块；更左的 block 不可能越界，无需重复检查。`,
+            R`可以把三类记成：Empty 由 BlockInfo 跳过，Full 直接计算，Partial 才逐元素处理。块稀疏路径不靠几何推断，而是由 CSR 表直接列出 full/partial block。CSR 是“每行只记录非空块下标”的压缩格式。`
           ],
           svg: "mask-segments"
         },
         {
           title: "第三层：行内列界与 R2P",
           body: [
-            R`Block 04：partial 块内，每个线程拿到自己负责的行号 <code>row_idx</code>，算出 <code>col_limit_right = row_idx + causal_row_offset + 1</code>（其中 <code>causal_row_offset = s_k - n_block·tile_n - s_q</code> 把端对齐和块偏移一次性吸收）。local mask 再加一个 <code>col_limit_left</code>。`,
-            R`Block 05 的 R2P 三件套：<code>r2p_bitmask_below(limit, s)</code> 用一次右移生成「第 s 个 32 列 chunk 中保留 < limit」的位掩码（inline PTX 避免移位宽度未定义行为）；<code>r2p_bitmask_above</code> 对称处理下界；<code>mask_r2p_lambda</code> 在编译期展开的循环里把位掩码逐位喂给 SEL——<code>range_constexpr</code> 是必须的，否则编译器无法生成 R2P 指令。local mask 的双界直接 AND 两个位掩码，优雅至极。`
+            R`进入 partial block 后，<code>row_idx</code> 是当前 Q 行在切片内的相对下标。代码把 \(s_k-s_q\) 和当前 K block 的起点合并成 <code>causal_row_offset</code>，于是 <code>col_limit_right</code> 直接给出该行在当前 block 内可保留到哪一列。滑动窗口还会得到左边界 <code>col_limit_left</code>。`,
+            R`<code>r2p_bitmask_below</code> 生成“保留右边界左侧列”的 32 位掩码，<code>r2p_bitmask_above</code> 生成“保留左边界右侧列”的掩码。滑动窗口把两者按位 AND。编译期展开循环后，硬件可用一条 R2P 指令把 32 位映射到 32 个谓词。`
           ],
-          formula: R`<p>指令量对比（一个 128 列 tile、每行 \(n_{\mathrm{func}}\) 个合法区间）：</p>
+          formula: R`<p>指令量对比：设一个 128 列 tile 中，每行有 \(n_{\mathrm{func}}\) 个连续合法区间；普通 causal 时 \(n_{\mathrm{func}}=1\)。</p>
 \[ \text{逐元素：}\; \approx 128\, n_{\mathrm{func}}\ \text{条 ISETP} + 128\,(\tfrac{n_{\mathrm{func}}}{2}{+}1)\ \text{条 SEL}; \]
 \[ \text{R2P：}\; \lceil 128/32 \rceil \times O(n_{\mathrm{func}})\ \text{条位运算} + 128\ \text{条 SEL} . \]
 <p>比较与坐标加法几乎全部消失，SEL 固定 128 条。这是 FA4 fork 中验证过的优化（当时按 24 位一批），SM100 原生实现按 32 位 chunk 重写。</p>`
@@ -420,13 +420,13 @@
         {
           title: "可编程出口：mask_mod 与 block sparse",
           body: [
-            R`Block 06：当几何超出 causal/local 的表达力（如任意 document mask、NSA 式动态稀疏），走 FlexAttention 风格的 <code>mask_mod(b, h, q_idx, kv_idx, seqlen_info, aux_tensors)</code> 逐元素谓词。它昂贵，所以搭配 block-sparse 表使用：CSR 化的 <code>mask_block_idx</code>（partial 块清单）与 <code>full_block_idx</code>（full 块清单）,full 块调用不带 mask_mod 的版本（<code>mask_fn_none</code>）,只做 OOB 检查。`,
-            R`PackGQA 的坐标还原也在这里:折叠进 seqlen 维的行号先 <code>divmod(global_row, qhead_per_kvhead)</code> 拆回 (真实行, head 偏移),再喂给 mask_mod——可编程接口看到的是逻辑坐标,物理打包对用户透明。`,
-            R`Block 07 回收第 0 章的伏笔:<code>MT_MAP</code> 只有 full/causal,<code>ranges_to_cu_seqlens</code> 断言 ranges 连续不重叠。INV/BI-CAUSAL 的原生支持（练习 6 设计过）与任意重叠 ranges,是这套三层防线接下来要长出的能力。`
+            R`任意 document mask 或动态稀疏无法只靠左右边界表达，此时使用 <code>mask_mod</code> 对元素求布尔值。为避免每个 block 都执行它，外部 CSR 表先列出 partial block 和 full block；full block 仍走无 mask 快路径。`,
+            R`PackGQA 会把多个 Q head 折叠到行维。调用 <code>mask_mod</code> 前，代码用 <code>divmod</code> 还原真实行号和 head 编号，因此用户看到的仍是逻辑坐标。`,
+            R`当前 SM100 CuTe DSL 路径仍只原生支持 full/causal 和连续不重叠 ranges。INV/BI-CAUSAL 与重叠 ranges 尚未完整接入这三层实现。`
           ]
         }
       ],
-      warning: R`「causal」在本仓库里恒指<strong>端对齐</strong>（右下对齐）：\(k \le q + (s_k - s_q)\)。与「左上对齐」（\(k \le q\)）在 \(s_q \ne s_k\) 时完全不同。读任何 mask 相关代码前先确认对齐约定，否则 BlockInfo 的跳块公式会显得莫名其妙。`,
+      warning: R`本仓库的 causal 是右下对齐。只有 \(s_q=s_k\) 时，它才退化为熟悉的 \(k\le q\)。若 Q、K 长度不同，必须使用偏移 \(s_k-s_q\)。`,
       exercises: [
         {
           kind: "计算", level: "基础",
@@ -482,22 +482,22 @@
       order: 4,
       title: "Online Softmax",
       fullTitle: "Online Softmax on TMEM",
-      zhTitle: "指数运算的工业化",
+      zhTitle: "逐块完成稳定的 Softmax",
       tag: "SM100 · 数值",
       category: "linear",
       difficulty: "进阶",
       source: "kernel/cutedsl/softmax.py + softmax_step",
-      deck: R`softmax 是注意力里唯一的非线性，也是 SM100 前向唯一「用 CUDA core 算数」的地方。本章从 online softmax 的递推公式出发，走完 softmax_step 的九个动作，最后解决一个 B200 特有的瓶颈：SFU 的 exp2 吞吐不够,怎么办？答案是用 FMA 管线<strong>多项式仿真 exp2</strong>。`,
-      takeaway: R`Online softmax 把「全行归一化」拆成可流式的三元组 \((m, \ell, O)\)：新块只需更新 \(m\)、给出一个标量 <code>corr_scale</code> \(=2^{(m_{\mathrm{old}}-m_{\mathrm{new}})\cdot c}\)，归一化推迟到最后。SM100 实现的两个关键改写：一切指数用 <strong>exp2</strong>（把 \(\ln 2\) 吸进 scale），以及当 SFU 不够快时,按 <code>ex2_emu_freq</code> 的节奏把部分 exp2 换成 <strong>FMA 管线上的多项式仿真</strong>——两条发射端口同时吐指数。`,
+      deck: R`Softmax 通常需要先看完整一行才能归一化。Online softmax 则按 KV block 逐块处理，只保存少量行统计量。本章先解释递推公式，再按执行顺序阅读 <code>softmax_step</code>，最后说明为何 B200 会用 FMA 多项式近似一部分 <code>exp2</code>。`,
+      takeaway: R`每行只需维护三个量：\(m\) 是目前见过的最大分数，\(\ell\) 是以 \(m\) 为基准的指数和，\(O\) 是尚未除以 \(\ell\) 的输出。新 block 若抬高 \(m\)，旧的 \(\ell\) 和 \(O\) 都乘同一个 <code>corr_scale</code> 后继续累加。最终只归一化一次。`,
       intuitions: [
-        { label: "流式", title: "推迟归一化", body: R`不必等所有分数到齐才除以 \(\sum e^s\)：维护跑动的 max 和 sum，旧的 O 用一个标量补差价。` },
-        { label: "换底", title: "exp2 是硬件的母语", body: R`\(e^x = 2^{x\log_2 e}\)。把 \(\log_2 e\) 乘进 softmax scale 后，内层循环只剩 FMA 和 ex2。` },
-        { label: "双管线", title: "SFU 堵车就走 FMA", body: "MUFU.EX2 吞吐有限;多项式仿真用 packed f32x2 的 FMA 算 exp2,两条端口并行,总吞吐反超。" }
+        { label: "流式", title: "先累加，最后再除", body: R`不必等整行分数到齐。每处理一个 block，就更新 max、指数和与未归一化输出。` },
+        { label: "换底", title: "统一使用以 2 为底的指数", body: R`利用 \(e^x=2^{x\log_2 e}\)，提前把 \(\log_2 e\) 合并进缩放系数，内层直接使用硬件 <code>exp2</code>。` },
+        { label: "双管线", title: "硬件指数忙时借用 FMA", body: "SFU 是执行特殊函数的单元。它吞吐不足时，部分 exp2 改用 FMA 多项式近似，让两类执行单元并行工作。" }
       ],
       motivation: [
-        R`第 2 章讲了 softmax warp 拿着全场最多的寄存器（176–256/线程），本章解释这些寄存器在算什么。一个 softmax_step 处理一个 128×128 的 S 块：每线程分到一行的 128 个 fp32,要做 mask、求 max、减 max、乘 scale、exp2、转 bf16、写回、更新 row_sum——全部在寄存器里完成。`,
-        R`数值稳定性的约束塑造了每一步:减 max 防上溢;\(-\infty\) 行的 row_max 用 0 兜底（<code>row_max_safe</code>）防 NaN;FP8 时还有 <code>max_offset=8</code> 把动态范围往上挪。这些「小心思」都在 <code>SoftmaxSm100</code> 的十几行里。`,
-        R`最后是 B200 的现实:hd128 配置下 softmax 的 exp2 需求接近 SFU 峰值,而 SM103（B300）SFU 更快。所以调参表里 SM100 的 <code>ex2_emu_freq</code> 是 10–16（周期性仿真）,SM103 全部为 0（纯硬件）——一张表写尽两代芯片的性格差异。`
+        R`一个 <code>softmax_step</code> 处理 128×128 的分数块 \(S\)。线程把自己负责的分数读进寄存器，依次应用 mask、求行最大值、计算指数、写出概率块 \(P\)，并更新行和。`,
+        R`减去行最大值可防止指数上溢。全被 mask 的行最大值是 \(-\infty\)，代码临时用安全值替代，避免后续出现 NaN。FP8 路径还会平移指数范围，后文单独解释。`,
+        R`B200 上大量 <code>exp2</code> 可能压满 SFU。调参表会周期性地把一部分指数换成 FMA 多项式近似；SM103 的 SFU 更快，因此该优化关闭。`
       ],
       diagram: {
         key: "softmax",
@@ -507,9 +507,9 @@
         {
           title: "Online softmax 的递推",
           body: [
-            R`标准推导（FA2 一脉相承）:维护每行状态 \((m_i, \ell_i)\) 与未归一化输出 \(O_i\)。新块 \(S_i\) 到来时先并入 max,再把旧的 \(\ell\)、\(O\) 用同一个标量缩放,最后累加新块的贡献。全部块处理完后 \(O \leftarrow O/\ell\) 一次归一化,\(\mathrm{LSE} = m + \ln \ell\)。`,
-            R`SM100 版的分工（对照 Block 03/07）:<code>update_row_max</code> 返回 \((m_{\mathrm{safe}}, \text{corr\_scale})\),corr_scale 经 sScale 发布给 correction warp（去改 O,第 5 章）;softmax 自己只负责 \(\ell\) 的缩放累加（<code>update_row_sum</code>,Block 05）。也就是说:<strong>三元组的三个分量由两组 warp 分头维护</strong>,凭 corr_scale 这一个标量保持一致。`,
-            R`Block 07 里还有一个 <code>rescale_threshold</code> 门:若 \(\Delta m \cdot c\) 足够小（acc_scale ≈ 1）,干脆保留旧 max、令 corr_scale=1——correction 侧用 <code>vote_ballot_sync(corr_scale < 1.0)</code> 整 warp 投票,全票 ≈1 就跳过整次 rescale。数值上安全（exp 参数只是略偏离 0）,性能上省一次 128×128 的 TMEM 读改写。`
+            R`处理第 \(i\) 个分数块 \(S_i\) 时，先得到新的最大值 \(m_i\)。若最大值变大，先把旧指数和 \(\ell_{i-1}\) 与旧输出 \(O_{i-1}\) 换算到新基准，再加入当前块。所有 block 结束后执行 \(O_N/\ell_N\)。`,
+            R`SM100 让两组 warp 分工：softmax warp 更新 \(m\) 和 \(\ell\)，correction warp 缩放 \(O\)。二者通过同一个 <code>corr_scale</code> 保持相同基准。`,
+            R`若最大值变化很小，<code>rescale_threshold</code> 会把 <code>corr_scale</code> 直接设为 1。correction warp 随后可整块跳过 O 的读改写，以少量可控近似换取更少工作。`
           ],
           formula: R`\[ m_i = \max(m_{i-1}, \operatorname{rowmax}(S_i)), \qquad \text{corr\_scale} = 2^{(m_{i-1} - m_i)\,c}, \quad c = \text{softmax\_scale}\cdot\log_2 e, \]
 \[ \tilde P_i = 2^{\,S_i c \,-\, m_i c}, \qquad \ell_i = \ell_{i-1}\cdot \text{corr\_scale} + \operatorname{rowsum}(\tilde P_i), \qquad O_i = O_{i-1}\cdot \text{corr\_scale} + \tilde P_i V_i . \]
@@ -518,17 +518,17 @@
         {
           title: "softmax_step 逐行读",
           body: [
-            R`Block 01–05 按执行顺序排列。① <code>consumer_wait(S-full)</code> + T2R:一次 <code>Ld32x32b</code> 系 copy 把本线程的 128 个 fp32 拉进寄存器。② 挂载点:score_mod（softcap 也从这里进来——host 把它包装成 score_mod）与 mask_fn（第 3 章的成果,full 段编译期为空）。③ <code>update_row_max</code> → 写 corr_scale 到 sScale → <code>sm_stats_barrier.arrive</code>:注意这发生在 exp2 <em>之前</em>——correction 越早拿到 scale,越早开始改 O,与本 warp 的 exp2 完全并行。`,
-            R`④ <code>scale_subtract_rowmax</code>:一条 packed FMA 同时处理两个元素,\(s \cdot c + (\text{max\_offset} - m c)\)。⑤ <code>apply_exp2_convert</code>:exp2 + 转 bf16 一体完成（详见下节）。⑥ R2T 写 P（含 split_P_arrive 的提前放行,第 2 章讲过）。⑦ WAR acquire:确认 correction 已读走上一个 scale,才允许下一次覆写 sScale。⑧ <code>update_row_sum</code>——被刻意安排在 acquire <em>之后</em>,让这段纯寄存器计算填满等待窗口。`,
-            R`一个值得玩味的细节:mask 存在的 step 会强制 <code>ex2_emu_freq=0</code>（Block 04 的三元式）——被 mask 的行里有 \(-\infty\),多项式仿真在极端输入下的行为不如硬件 ex2 可靠,宁可慢一点也要走硬件路径。`
+            R`执行顺序是：① 等 S 写完并读入寄存器；② 应用可选的 <code>score_mod</code> 和 mask；③ 更新行最大值，并尽早把 <code>corr_scale</code> 发给 correction；④ 计算 \(s\cdot c-mc\)；⑤ 执行 <code>exp2</code> 并转换 P 的 dtype；⑥ 把 P 写回 TMEM；⑦ 确认旧 scale 已被读取；⑧ 更新 row_sum。`,
+            R`<code>corr_scale</code> 在指数计算前发布，使 correction 能与当前 warp 的 exp2 并行。row_sum 则放在可能等待的 WAR acquire 之后，用无依赖计算填补等待时间。`,
+            R`只要本步包含 mask，就强制使用硬件 <code>exp2</code>。原因是被 mask 的输入为 \(-\infty\)，而多项式近似会先截断输入，不能自然得到精确的 0。`
           ]
         },
         {
           title: "ex2 仿真：把指数算在 FMA 管线上",
           body: [
-            R`B200 的 SFU（MUFU.EX2）每周期每 SM 吞吐有限,而 softmax 每元素恰好一次 exp2——hd128 时 exp2 需求逼近 SFU 峰值,SFU 成了整条流水线的短板。解法:一部分 exp2 改在 FMA 管线上用多项式仿真,两条发射端口并行出活。`,
-            R`Block 08 的 <code>ex2_emulation_2</code> 逐步拆解:(1) clamp 到 \([-127, \infty)\) 防下溢;(2) 加 magic number \(2^{23}+2^{22}\) 并用 <strong>round-down</strong> 模式取整——浮点加法的舍入行为免费完成 floor,整数部分 \(\lfloor x \rfloor\) 落在尾数低 8 位;(3) 减回 magic 得到 \(\lfloor x\rfloor\),原值相减得小数部分 \(f \in [0,1)\);(4) 3 次多项式估值 \(2^f\)（3 条 packed FMA 处理一对元素）;(5) <code>combine_int_frac_ex2</code> 把 \(\lfloor x\rfloor\) 直接加进指数位。全程无分支、无查表,packed f32x2 使每条指令处理两个元素。`,
-            R`调度由三个旋钮控制（Block 06）:<code>ex2_emu_freq</code>——每多少对元素里安排一次仿真（值越大仿真越少,0=全硬件）;<code>ex2_emu_start_frg</code>/<code>ex2_emu_res</code> 控制从哪个 fragment 开始、每周期仿真几对。本质是在做<strong>双资源的静态负载均衡</strong>:让 SFU 与 FMA 的占用比恰好匹配它们的吞吐比。SM103 SFU 提速后全部归零——同一份代码,两种芯片,两套节奏。`
+            R`B200 的 SFU 吞吐有限，而 softmax 每个元素都需要一次指数。kernel 因此把一部分指数交给空闲的 FMA 管线近似计算，使 SFU 与 FMA 同时工作。`,
+            R`近似过程先把 \(x\) 拆成整数部分 \(\lfloor x\rfloor\) 和小数部分 \(f\)。整数部分通过调整 IEEE-754 指数位实现 \(2^{\lfloor x\rfloor}\)，小数部分 \(2^f\) 用三次多项式估计。magic number 与向下舍入用于快速取得 \(\lfloor x\rfloor\)。`,
+            R`<code>ex2_emu_freq</code> 控制多长间隔使用一次近似；另外两个参数控制从哪个 fragment 开始及一次处理多少元素。目标不是全部替代 SFU，而是让 SFU 与 FMA 的工作量同时接近各自吞吐上限。`
           ],
           formula: R`<p>仿真的数学骨架：设 \(x = \lfloor x \rfloor + f\)，\(f\in[0,1)\)，则</p>
 \[ 2^x = 2^{\lfloor x\rfloor}\cdot 2^{f}, \qquad 2^{f} \approx p_3(f) = c_0 + c_1 f + c_2 f^2 + c_3 f^3, \]
@@ -537,12 +537,12 @@
         {
           title: "FP8 与 max_offset",
           body: [
-            R`FP8 输入时 P 也要量化到 FP8（e4m3 动态范围 ±448）。<code>max_offset=8</code> 把 exp2 的参数整体抬高 8：\(\tilde P = 2^{sc - mc + 8} = 256\cdot P\)，让 P 的典型值从 \((0,1]\) 挪到 \((0,256]\)，充分利用 e4m3 的表示密度；correction 尾声再除掉 \(2^{8}\)（藏在 <code>max_offset_scale</code> 与 v_descale 里）。LSE 计算同样要减回 offset（第 5 章 Block 06 里的 <code>- max_offset</code>）。`,
-            R`这类「在指数域做平移」的技巧之所以廉价，是因为整条链路都以 2 为底：平移只是 FMA 的 bias 项改一个常数，没有任何额外指令。`
+            R`FP8 的 P 若直接落在 \((0,1]\)，会浪费大部分 e4m3 动态范围。<code>max_offset=8</code> 将指数参数加 8，相当于把 P 放大 \(2^8=256\) 倍；尾声和 LSE 再减回这项缩放。`,
+            R`由于计算统一使用以 2 为底的指数，这个放大只需改一个加法常数，不增加额外指数指令。`
           ]
         }
       ],
-      warning: R`corr_scale 的语义是「旧 max 相对新 max 的贬值率」，恒 ≤1；它乘在<strong>旧的</strong> \(\ell\) 和 \(O\) 上，而不是新块上。首块（is_first）没有旧状态，corr_scale 无意义也不发布——correction 的 prologue 直接放行。混淆新旧方向是手推 online softmax 最常见的错误。`,
+      warning: R`<code>corr_scale</code> 只修正旧状态：它乘旧的 \(\ell\) 和 \(O\)，不乘当前 block。第一块没有旧状态，因此不需要发布该值。`,
       exercises: [
         {
           kind: "推导", level: "基础",
@@ -598,22 +598,22 @@
       order: 5,
       title: "Correction 与归约",
       fullTitle: "Correction, Epilogue & LSE",
-      zhTitle: "把 partial 结果变成承诺的输出",
+      zhTitle: "校准并写出 O / LSE",
       tag: "SM100 · 归约",
       category: "sparse",
       difficulty: "进阶",
       source: "kernel/cutedsl/ffa_fwd_sm100.py · correction_loop",
-      deck: R`第 0 章承诺的「可累加 out + 可合并 lse」，由 correction warpgroup 兑现：主循环里它用 corr_scale 持续校准 TMEM 中的 O，尾声用 \(1/\ell\) 归一化、并入 sink、转换精度、写出 O 与 LSE。本章同时讲透它与 softmax 之间那对精妙的 RAW/WAR 握手。`,
-      takeaway: R`Correction 是 online softmax 的「债务清算人」：softmax 每换一次 max 基准，旧 O 就欠一笔 \(\times\text{corr\_scale}\) 的债，correction 在<strong>别人的空隙里</strong>逐块还清；尾声一次性清算 \(\times 1/\ell\)。它与 softmax 只共享 <strong>sScale 一个槽位</strong>——RAW 用 named barrier、WAR 用 pipeline，而 correction 的 <strong>cross-release</strong>（释放对面 stage 的槽位）让单组 correction 以圆舞曲的节奏轮流服务两组 softmax。`,
+      deck: R`Correction warpgroup 负责两件事：主循环中用 <code>corr_scale</code> 把旧输出 O 换到新的最大值基准；所有 KV block 结束后，再除以行和 \(\ell\)，写出最终 O 和 LSE。本章重点是这两步，以及它和 softmax 如何安全共享缩放值。`,
+      takeaway: R`每当 online softmax 的最大值 \(m\) 变大，旧 O 都必须乘一次 <code>corr_scale</code>。correction warp 专门完成这项缩放，并与 softmax 并行。最后它再乘 \(1/\ell\) 完成归一化。`,
       intuitions: [
-        { label: "债务", title: "换基准就欠账", body: R`row_max 从 \(m_{old}\) 变 \(m_{new}\)，旧 O 的每个元素都高估了 \(2^{(m_{old}-m_{new})c}\) 倍的分母——乘 corr_scale 还账。` },
-        { label: "错峰", title: "在空隙里干活", body: "O 的 rescale 与下一块的 softmax 完全无依赖;correction 的全部工作都藏在 softmax 与 MMA 的影子里。" },
-        { label: "清算", title: "尾声一次归一", body: R`主循环维持未归一化的 \(O\)；最后 \(\times\,\mathrm{rcp}(\ell)\)、并 sink、转 dtype、写 gmem，LSE 同步产出。` }
+        { label: "换基准", title: "旧输出需要同步缩放", body: R`最大值从 \(m_{\text{old}}\) 变为 \(m_{\text{new}}\) 后，旧 O 乘 \(2^{(m_{\text{old}}-m_{\text{new}})c}\)，才能与新 block 使用同一基准。` },
+        { label: "并行", title: "缩放与下一步 softmax 重叠", body: "correction 修改旧 O 时，softmax 可继续计算当前 block 的 P；两者处理不同数据。" },
+        { label: "收尾", title: "最后统一归一化", body: R`主循环中的 O 仍未除以 \(\ell\)。尾声执行 \(O/\ell\)，处理可选 sink，再写出 O 和 LSE。` }
       ],
       motivation: [
-        R`online softmax 的三元组 \((m,\ell,O)\) 中,\(O\) 的体积是另外两者的 128 倍（128×128 fp32 vs 两个每行标量）。把「改 O」交给专职 warpgroup,是 SM100 版本相对 Hopper FA3 的关键重构——FA3 里 rescale 由算 softmax 的同一 warpgroup 顺手做,挤占寄存器且拉长关键路径。`,
-        R`correction 的难点不在计算（乘一个标量）,在<strong>同步协议</strong>:corr_scale 经 SMEM 的 sScale 槽位从 softmax 流向 correction,一个槽位、两个写者时机（主循环 corr_scale / 尾声 row_sum）、两个读者时机,还要在两个 Q-stage 之间轮转。源码用「RAW 靠 barrier、WAR 靠 pipeline、轮转靠 cross-release」三招解决,值得逐行品味。`,
-        R`尾声则是数值收口:除以 row_sum 之前要处理三件事——空行（row_sum=0 或 NaN,用 1.0 兜底避免除零,输出自然为 0）、learnable sink（在分母里补一项 \(2^{s_{\mathrm{sink}}\log_2 e - mc}\)）、FP8 的 v_descale 与 max_offset 回补。LSE 的合成公式则直接回应第 0 章的合并语义。`
+        R`\(m\) 和 \(\ell\) 每行只有一个标量，O 却有 128 列。若 softmax warp 同时修改 O，会增加寄存器压力并延长关键路径。SM100 因此安排独立 correction warpgroup。`,
+        R`真正困难的是同步。softmax 通过 SMEM 槽位 <code>sScale</code> 发送 <code>corr_scale</code>；correction 读完前，softmax 不能覆盖它。RAW（read after write）表示“写完才能读”，WAR（write after read）表示“读完才能再写”。`,
+        R`尾声还要处理空行、可选 attention sink 和 FP8 缩放。Attention sink 可看成只有分数、没有 V 的虚拟 token：它增加 softmax 分母，但不增加输出分子。`
       ],
       diagram: {
         key: "correction",
@@ -623,39 +623,39 @@
         {
           title: "sScale：一个槽位的完整协议",
           body: [
-            R`Block 01:sScale 每个 Q-stage 每行有 2 个槽——主循环的 corr_scale 与尾声的 row_sum/row_max 分开存放（后者在偏移 <code>q_stage*128</code> 处,见第 4 章 softmax_loop 尾声的写入）。`,
-            R`RAW（数据就绪）:softmax 写完 → <code>sm_stats_barrier.arrive</code>（非阻塞）;correction <code>arrive_and_wait</code> 会合后才读。WAR（槽位可覆写）:correction 读完 → <code>pipeline_sm_stats.consumer_release</code>;softmax 在下一次写之前 <code>producer_acquire</code> 确认。一个槽位上两种冒险,分别交给两种原语——barrier 无相位、适合每次会合;pipeline 有相位、适合跨迭代的占用权转移。`,
-            R`<strong>cross-release</strong>（Block 02 尾部）:主循环里 correction 释放的不是当前 stage 的槽位,而是 <code>q_stage-1-stage</code>——对面的。效果:softmax0 发布 scale 后,要等 correction 服务完 softmax1 才拿回自己槽位的写权。单组 correction 于是像圆舞曲一样在两组 softmax 之间交替,任何时刻只有一组 softmax 与 correction 重叠,另一组安静地停在 acquire 上——这同时也是两组 softmax 的天然错峰器（与第 2 章的 s0_s1_barrier 相辅相成）。尾声改回直接 release（不再轮转）,并在切换前补一次 release 排空主循环留下的「悬空槽」。`
+            R`每个 Q stage 的 <code>sScale</code> 有两类位置：主循环存 <code>corr_scale</code>，尾声存 row_sum/row_max。二者使用不同偏移，不会互相覆盖。`,
+            R`softmax 写完后在 named barrier 上 arrive；correction 等到后再读，这是 RAW 保护。correction 读完后释放 pipeline 槽位；softmax 下次写前先 acquire，这是 WAR 保护。`,
+            R`<strong>cross-release</strong> 会释放另一组 softmax 的槽位，而非当前组。结果是 correction 在 softmax0 和 softmax1 之间交替服务，两组不会同时争抢 correction 或 TMEM 写口。尾声不再轮转，因此恢复直接 release。`
           ],
           svg: "correction-handshake"
         },
         {
-          title: "主循环：ballot 决定要不要还账",
+          title: "主循环：ballot 决定是否缩放 O",
           body: [
-            R`Block 02:读到 corr_scale 后,<code>vote_ballot_sync(corr_scale < 1.0)</code> 让整个 warp 投票——只要有任一行的 scale 显著小于 1 就整块 rescale;全体 ≈1（配合第 4 章的 rescale_threshold 门控）则跳过。注意投票粒度是 warp（32 行）,以 warp 为单位跳过是 TMEM copy 原子宽度决定的。`,
-            R`Block 03 的 rescale 本体:按 corrHD=16 列一批,T2R（<code>Ld32x32b</code>）→ packed f32x2 乘法 → R2T（<code>St32x32b</code>）,最后 <code>fence_view_async_tmem_store</code> 保证对 MMA warp 可见。128 列分 8 批流过寄存器,每线程瞬时只驻留 16 个 fp32——这就是 correction 只要 64–88 个寄存器的原因。`,
-            R`随后的 <code>pipeline_s_p_o.consumer_release</code> 是第 2 章讲过的「O 侧放行」:MMA 由此得知 O(i-1) 已校准,可以发起向同一 TMEM 区域累加的下一次 PV GEMM。`
+            R`读到 <code>corr_scale</code> 后，一个 warp 对自己负责的 32 行投票。只要有一行需要缩放，就处理整组；若全部为 1，则整组跳过。`,
+            R`真正缩放时，每次只读 16 列 O 到寄存器，乘 scale 后写回。128 列分 8 批完成，避免一次占用过多寄存器。最后的 fence 确保 MMA warp 能看到更新结果。`,
+            R`O 校准完成后，correction 释放 <code>pipeline_s_p_o</code> 的 O 条件。MMA 收到 P、O 两侧信号后，才可向同一 TMEM 区域累加下一次 PV。`
           ]
         },
         {
           title: "尾声：归一化、sink 与空行",
           body: [
-            R`Block 04:读最终 row_sum/row_max → 若有 sink,分母补一项 \(2^{s\log_2 e - mc + \text{offset}}\)（learnable sink 等价于每行多一个 logit 为 \(s\) 的虚拟 token,它只进分母不贡献 V）→ 空行检测 <code>row_sum==0 || row_sum!=row_sum</code>,兜底 scale=1 → <code>rcp_approx(row_sum)</code> 得归一化系数（顺手乘 FP8 的 v_descale）→ 显式等 <code>pipeline_o_acc</code>（第 2 章练习 3 的「断裂点」）。`,
-            R`Block 05:<code>correction_epilogue</code> 把 \(O \times \mathrm{rcp}(\ell)\)、转换为输出 dtype、写进 SMEM 的 sO;非 varlen 时 commit 给 epilogue warp 走 TMA store,varlen 时 correction 自己逐行写 gmem。`
+            R`尾声先读取最终 row_sum 和 row_max。若启用 sink，就向分母增加一个虚拟 token 的指数权重。若 row_sum 为 0 或 NaN，则用 scale=1 避免除零；由于空行的 O 本身为 0，最终仍写出 0。`,
+            R`随后等待最后一次 O 累加完成，计算 \(O/\ell\)，转换为输出 dtype。定长序列经 SMEM 和 TMA 写回；变长序列由 correction warp 按有效行直接写回。`
           ]
         },
         {
-          title: "LSE：写给「下一次合并」的收据",
+          title: "LSE：保留后续合并所需的归一化信息",
           body: [
-            R`Block 06:\(\mathrm{LSE} = (m\,c + \log_2 \ell - \text{max\_offset})\cdot\ln 2\)。这是自然对数意义下的 \(\log\sum e^{s\cdot\text{scale}}\),空行写 \(-\infty\)。每线程负责一行,PackGQA 时还要把折叠行号拆回 (head, 行) 散写。`,
-            R`把第 0 章的合并公式与这里连起来,就看清了 MagiAttention 分布式的完整闭环:每个 rank 的 FFA kernel 产出 \((O^{(r)}, \mathrm{LSE}^{(r)})\),GroupReduce 用合并公式把它们归约成全局结果——kernel 内的 correction 是「块间归约」,分布式的 correction 是「rank 间归约」,数学上是同一个半群运算在两个尺度上的重复。`
+            R`LSE 公式为 \(\mathrm{LSE}=(mc+\log_2\ell-\text{max\_offset})\ln2\)。它还原为自然对数下的 \(\log\sum e^{s\cdot\text{scale}}\)；空行写 \(-\infty\)。`,
+            R`每个 rank 都输出一对 \((O,\mathrm{LSE})\)。分布式 GroupReduce 再用第 0 章的公式合并这些局部结果。kernel 内按 KV block 合并、kernel 外按 rank 合并，使用的是同一套数学结构。`
           ],
           formula: R`<p>验证 kernel 内与 kernel 间归约的一致性：kernel 尾声输出 \(O = \frac{\sum_k \tilde p_k v_k}{\ell}\)、\(\mathrm{LSE} = mc' + \ln \ell\)（\(c'=c\ln2\)）。两个 rank 合并时</p>
 \[ w_r = e^{\mathrm{LSE}_r - \mathrm{LSE}},\qquad O = \sum_r w_r O_r = \frac{\sum_r e^{\mathrm{LSE}_r} O_r}{e^{\mathrm{LSE}}} = \frac{\sum_r \sum_{k\in K_r} e^{s_k c'} v_k}{\sum_r \sum_{k \in K_r} e^{s_k c'}}, \]
 <p>与把全部 K 交给单 kernel 的结果逐项相等。fp32 的 out 累加路径（functional 层 atomic 模式）走的正是分子分母同时累加的等价形式。</p>`
         }
       ],
-      warning: R`corr_scale < 1 的 ballot 判断依赖第 4 章的 rescale_threshold 约定：softmax 侧把「接近 1」的 scale 直接规范成 1.0。若单独修改一侧的阈值逻辑，会出现 correction 频繁做无效 rescale 或漏掉必要 rescale 的隐性 bug——这对参数必须成对演化。`,
+      warning: R`softmax 负责把“足够接近 1”的 <code>corr_scale</code> 规范为精确 1，correction 再据此跳过缩放。修改阈值时必须同时检查两侧，否则可能多做工作或漏做缩放。`,
       exercises: [
         {
           kind: "概念", level: "基础",
@@ -715,17 +715,17 @@
       category: "hybrid",
       difficulty: "进阶",
       source: "kernel/cutedsl/tile_scheduler.py · 1727 行",
-      deck: R`mask 让每个 Q tile 的工作量天差地别：causal 下最后一个 tile 的计算量是第一个的 N 倍。调度层的使命是把这堆参差不齐的砖块严丝合缝地码进固定数量的 SM。FFA 备了四种调度器，外加 Blackwell 的硬件杀器——CLC（Cluster Launch Control）动态派工。`,
-      takeaway: R`调度的三个正交决策：<strong>顺序</strong>（LPT——最重的块最先跑，装箱论的经典启发式）、<strong>亲和</strong>（L2 swizzle——让同时在跑的 CTA 尽量共享同一个 head 的 K/V）、<strong>分配方式</strong>（静态 grid-stride vs CLC 硬件动态派工）。三者在 <code>SingleTileLPTScheduler</code> 里合体：坐标映射管前两个，SchedulingMode 管第三个。而 host 侧的启发式提醒我们：<strong>动态调度不是免费午餐</strong>——负载本来均匀时，它只剩开销。`,
+      deck: R`一个 Q tile 是一次调度任务。causal mask 下，靠后的 Q tile 能看到更多 K，因此任务大小不同。调度器要把这些轻重不一的任务分给有限数量的 SM，尽量避免某些 SM 已空闲而另一些仍在处理大任务。`,
+      takeaway: R`调度器做三件互相独立的事：LPT 决定先做重任务还是轻任务；L2 swizzle 让同时运行的 CTA 尽量复用相同 K/V；静态分配或 CLC 决定下一项工作由软件预先指定，还是由硬件动态派发。`,
       intuitions: [
-        { label: "顺序", title: "先搬大石头", body: "往桶里装石头要先大后小。causal 尾部的重 tile 若排在最后启动,其他 SM 只能干等它收尾。" },
-        { label: "亲和", title: "邻居共享冰箱", body: "同一 head 的 K/V 是 CTA 之间唯一可共享的大宗数据;让相邻 tile_idx 落在同一 head,L2 命中率决定有效带宽。" },
-        { label: "分配", title: "领任务 vs 派任务", body: "静态:每个 CTA 按固定步长自取。CLC:算完找硬件领下一份——空闲 SM 自动多领,负载自平衡。" }
+        { label: "顺序", title: "先做最重的任务", body: "LPT 是 Longest Processing Time first。先启动重 tile，收尾时只剩轻 tile，更容易让所有 SM 同时结束。" },
+        { label: "亲和", title: "让相邻任务复用缓存", body: "处理同一 head 的 CTA 会读取相同 K/V。把它们安排得更接近，可提高 L2 命中率。" },
+        { label: "分配", title: "静态分配与动态领取", body: "静态模式预先确定每个 CTA 的任务序列；CLC 让 CTA 完成一项后再向硬件领取下一项。" }
       ],
       motivation: [
-        R`先量化问题:方阵 causal 下第 \(m\) 个 Q tile 要迭代 \(m+1\) 个 KV block,最重与最轻差 \(n\) 倍。若按自然顺序静态分配,尾部的重 tile 最后才开始,长尾拖垮整卡利用率——这就是 LPT（Longest Processing Time first）要解的装箱问题。`,
-        R`第二个问题是缓存:B200 一个 SM 同时只跑一两个 CTA,但全卡上百个 CTA 并发;它们的 K/V 读取都过同一块 L2。若并发的 CTA 分属不同 (head, batch),L2 里塞满互不相干的 K/V,命中率崩塌。调度器的坐标映射必须让「时间上相邻的 tile_idx」尽量「空间上共享 K/V」。`,
-        R`第三个问题是不可预测性:varlen 下每条序列的块数不同,block-sparse 下有效块数取决于数据,静态映射再聪明也只是估计。Blackwell 的 CLC 给了硬件级答案:persistent CTA 每做完一个 tile,向硬件调度器申请下一个,响应写进 SMEM、mbarrier 通知——工作窃取的延迟被硬件压到微秒之下。`
+        R`方阵 causal 中，第 \(m\) 个 Q tile 需要处理 \(m+1\) 个 KV block。若按从轻到重的自然顺序启动，最后才开始的重任务会形成长尾。LPT 通过反转顺序解决这个问题。`,
+        R`调度还影响缓存。多个 CTA 若处理同一 head，会读取同一份 K/V；若把这些 CTA 安排在相近时间运行，L2 更可能保留所需数据。`,
+        R`变长序列和块稀疏任务的大小更难提前预测。CLC（Cluster Launch Control）允许 persistent CTA 每完成一个 tile，就向硬件申请下一个未分配坐标，并通过 SMEM 与 mbarrier 接收结果。`
       ],
       diagram: {
         key: "scheduler",
@@ -735,36 +735,36 @@
         {
           title: "四种调度器与选型决策树",
           body: [
-            R`Block 01 的决策链:varlen_q → <code>SingleTileVarlenScheduler</code>（warp 内前缀和 + ballot 定位 tile 属于哪条序列）;causal/local 或开 CLC → <code>SingleTileLPTScheduler</code>;dense 非 causal → <code>StaticPersistentTileScheduler</code>（CTA 数压到 SM 量级,grid-stride 轮询）;兜底 → <code>SingleTileScheduler</code>(一 CTA 一 tile,最简单)。`,
-            R`「persistent」的含义:grid 不再等于 tile 数,而是 ≈ SM 数;每个 CTA 循环消费多个 tile。收益有二:省去大量 CTA 启动/收尾开销;让 prologue（TMA 预取、TMEM 分配）跨 tile 复用。所有角色 warp 的主循环都写成统一骨架:<code>work_tile = initial_work_tile_info(); while valid: ...; advance_to_next_work()</code>——调度策略被完全封装在这两个调用后面。`
+            R`选型顺序如下：变长 Q 使用 varlen 调度器；causal/local 或 CLC 使用 LPT 调度器；稠密非 causal 使用静态 persistent 调度器；最简单的兜底方案是一 CTA 处理一 tile。`,
+            R`persistent 表示启动的 CTA 数量接近 SM 数，而不是 tile 总数；每个 CTA 在循环中连续处理多个 tile。这样可减少 CTA 启动开销，并复用部分初始化状态。各 warp 都通过同一组 <code>initial_work_tile_info</code> / <code>advance_to_next_work</code> 接口取得任务。`
           ]
         },
         {
           title: "LPT 与 L2 swizzle 的坐标算术",
           body: [
-            R`Block 02:先估「一个 head 的 K/V 体积」\(= s_k\times(d+d_v)\times\text{elem}\),用 50MB 的 L2 预算除之,得到能同居的 head 数,向下取 2 的幂作为 <code>swizzle</code>。Block 03 的映射把线性 tile_idx 分解成「大节拍 × swizzle 内偏移」:同一节拍内的 CTA 共享 swizzle 个 head 的 K/V;末尾不足一节拍的余数单独处理（residual 分支）。`,
-            R`LPT 只是最后一行:<code>block = num_block - 1 - block</code>——把块序反转,最重的（causal 下编号最大的）最先派发。配合 persistent 分配,轻重块自然穿插:先启动的 CTA 领走重块,做完时轻块还有剩,收尾整齐。`,
-            R`调度理论背书:LPT 对 makespan 的近似比是 \(\tfrac{4}{3}-\tfrac{1}{3m}\)（Graham 1969）;对 causal 这种「工作量线性递增」的特殊分布,LPT + 动态领取几乎达到下界。`
+            R`先估算一个 head 的 K/V 占用：\(s_k(d+d_v)\times\)元素字节数。用约 50MB L2 预算除以它，得到可同时保留多少个 head，再向下取 2 的幂作为 <code>swizzle</code>。线性 tile 下标随后按这个组大小重排。`,
+            R`LPT 的核心实现只是反转 block 编号：<code>block = num_block - 1 - block</code>。causal 中编号越大工作越重，所以重块最先派发。`,
+            R`makespan 指所有任务完成所需的总时间。一般任务上，LPT 的最坏情况有经典近似界；对工作量近似线性增长的 causal tile，它通常更接近理想均衡。`
           ],
           svg: "lpt-swizzle"
         },
         {
           title: "CLC：硬件动态派工",
           body: [
-            R`CLC（Cluster Launch Control）是 Blackwell 的新硬件路径:kernel 声明一个逻辑 tile 网格（<code>clc_problem_shape</code>）,persistent CTA 通过 <code>clctrl.try_cancel</code> 类指令向 GPU 调度器申请「下一个尚未派发的 cluster 坐标」,响应异步写进 SMEM 的 16 字节 response buffer,mbarrier 记账通知。`,
-            R`软件侧是一个标准 producer/consumer（Block 04/05/06）:调度 warp（empty warp 兼任,只在 leader CTA）循环 <code>prefetch_next_work</code>——acquire 空槽、把 mbarrier 地址交给硬件、advance;其余全部 warp 作为 consumer <code>consumer_wait → get_current_work → consumer_release</code>。sched_stages=1 时预取深度为 1:当前 tile 在算,下一个 tile 的坐标已在路上。`,
-            R`CLC 返回的是原始 grid 坐标,<code>clc_work_to_coords</code> 再套用 LPT 反转与 split_kv 解包——但<strong>不做 L2 swizzle</strong>(注释:hardware decides order):派发顺序已由硬件决定,软件重排坐标只会破坏硬件的局部性假设。`
+            R`CLC 模式下，kernel 先声明逻辑 tile 网格。调度 warp 向硬件请求一个尚未派发的坐标；硬件异步把响应写入 SMEM，并通过 mbarrier 通知。`,
+            R`调度 warp 是 producer，其余 warp 是 consumer。预取深度为 1 时，当前 tile 正在计算，下一个坐标已在请求途中。`,
+            R`CLC 返回原始 grid 坐标后，软件仍可做 LPT 反转和 split-KV 解包，但不再做 L2 swizzle。因为实际派发先后由硬件决定，软件无法再可靠控制同时运行的是哪些坐标。`
           ]
         },
         {
           title: "何时动态调度反而亏",
           body: [
-            R`Block 07 的 host 启发式明确了两个回退场景。<strong>dense noncausal</strong>:所有 tile 等重,静态映射本来就完美均衡,CLC 只添 work-stealing 开销。<strong>varlen MHA</strong>(qhead_per_kvhead=1):不均衡序列使更多 K/V block 同时在飞,加上 CLC 打乱顺序,L2 压力雪上加霜——实测回退。`,
-            R`这给出一个普适判断:<strong>动态调度买的是「против不可预测的不均衡」的保险</strong>。不均衡可预测(causal)时,LPT 静态排序已够;不均衡不可预测(block-sparse、CLC+LPT 组合)时保费才值得。工程上的验证路径:<code>MAGI_ATTENTION_FFA_CUTEDSL_CLC=1</code> 一键开关,benchmark 说话。`
+            R`两个场景会回退。稠密非 causal 的 tile 工作量相同，静态分配已经均衡，CLC 只增加请求开销。varlen MHA 中，CLC 还可能打乱 K/V 访问顺序并降低 L2 命中率。`,
+            R`因此动态调度主要解决<strong>难以预先预测</strong>的负载不均。若不均衡可由 causal 几何准确估计，LPT 往往已经足够。最终仍应通过环境变量开关做 benchmark。`
           ]
         }
       ],
-      warning: R`Persistent + CLC 模式下 grid 尺寸不再反映问题规模（只反映 SM 数）：任何「用 blockIdx 推断 tile 坐标」的直觉都失效，坐标必须一律经 tile_scheduler 获取。反向 kernel 的调度还有独立的一套（LPT/SPT + head_swizzle，为 deterministic 服务），不要与前向混用结论。`,
+      warning: R`Persistent + CLC 模式下，grid 大小接近 SM 数，不等于 tile 数。不能再从 <code>blockIdx</code> 直接推断任务坐标，必须通过 <code>tile_scheduler</code> 获取。`,
       exercises: [
         {
           kind: "计算", level: "基础",
@@ -824,17 +824,17 @@
       category: "dense",
       difficulty: "挑战",
       source: "kernel/cutedsl/ffa_bwd_sm100.py · 6001 行",
-      deck: R`反向是前向的镜像放大：计算量三倍（5 个 GEMM），依赖两倍（P 要重算，dS 是二级中间量），还多出一个前向没有的难题——dQ 的贡献散布在所有 K tile 上，必须跨 CTA 全局归约。本章用前六章建立的全部语言（TMEM、流水线、mask、调度、原子归约）读完这 6001 行的主干。`,
-      takeaway: R`反向的organizing principle 是<strong>「以 K 为家」</strong>：固定一块 K/V，扫过所有相关 Q——于是 \(dK, dV\) 在 TMEM 本地累加（免归约），代价是 \(dQ\) 变成「客场作战」，靠 <strong>TMA bulk atomic-add 到 fp32 的 dQaccum</strong> 全局归约；deterministic 模式不取消 atomic，而是用<strong>信号量把归约顺序钉死</strong>。P 不存不传，用 LSE 重算：\(P = 2^{Sc - \mathrm{LSE}\log_2 e}\)——前向写 LSE 的每一分钱在这里收回。`,
+      deck: R`反向需要五次矩阵乘：重算 S，计算 dP、dV、dS 之后再得到 dQ、dK。前向没有保存概率矩阵 P，因此反向用 S 和 LSE 重算它。另一个难点是：同一 dQ 会收到多个 K tile 的贡献，需要跨 CTA 求和。`,
+      takeaway: R`kernel 固定一个 K/V tile，再遍历所有相关 Q tile。这样 dK、dV 可在当前 CTA 的 TMEM 中累加并一次写出；dQ 则由多个 CTA 分别贡献，统一原子加到 fp32 <code>dQaccum</code>。确定性模式仍使用原子加，只是用信号量固定加法顺序。`,
       intuitions: [
-        { label: "主场", title: "dK/dV 在家收快递", body: R`一个 n_block 的 \(dK, dV\) 只依赖本块 K/V 与流过的 Q/dO——固定 K 扫 Q,贡献全部本地累加。` },
-        { label: "客场", title: "dQ 全局寄账", body: R`每块 K 都给每个 Q 一笔 \(dS\,K\) 的贡献;fp32 的 dQaccum + TMA atomic add 是跨 CTA 的记账本。` },
-        { label: "重算", title: "LSE 是重算的钥匙", body: R`前向不存 P（那是 \(O(n^2)\) 的量）,反向用 \(S\) 与 LSE 三条指令重造它,换来显存的自由。` }
+        { label: "局部累加", title: "dK/dV 留在当前 CTA", body: R`固定 K/V 后，所有经过的 Q/dO 都为同一块 dK、dV 提供贡献，因此可在 TMEM 中连续累加。` },
+        { label: "全局累加", title: "dQ 需要跨 CTA 求和", body: R`每个 K tile 都会贡献一部分 \(dQ=dS\,K\)。TMA 原子加把这些部分汇总到 fp32 缓冲。` },
+        { label: "重算", title: "用计算换显存", body: R`P 有 \(O(n^2)\) 个元素，前向不保存它。反向从分数 S 和每行 LSE 恢复 P，减少显存读写。` }
       ],
       motivation: [
-        R`先写清数学(下方公式)。五个矩阵乘的依赖链是:S(重算)→P(重算)→[dV 用 P; dP→dS 用 P]→[dK, dQ 用 dS]。其中 \(D_i = \operatorname{rowsum}(dO_i \odot O_i)\) 这个每行标量,是 softmax 反向的雅可比收缩项,由独立的 preprocess kernel 提前算好。`,
-        R`并行化的抉择:按 Q 分块(前向的方式)则 dQ 本地、dK/dV 全局归约(两个大张量要 atomic);按 K 分块则只有 dQ 要归约。FFA 选后者,而且 2-CTA 模式下 dK 的 GEMM 是 cluster 级的——两个 CTA 的 dS 各占一半,还需要一个专职 <strong>relay warp</strong> 把 peer CTA 的「dS 就绪」信号转发给 leader 的 MMA warp。`,
-        R`warp 分工与前向同构但重心迁移:16 warp = 4 reduce(dQ 归约,前向没有的角色) + 8 compute(softmax 重算与 dS,两个 warpgroup) + 1 MMA + 1 load + 1 relay + 1 empty。TMEM 更挤:S/P 叠放、dP/dS 叠放、<strong>dQ 叠在 dP 上</strong>(1-CTA)或嵌在 S 右半(2-CTA)——每一处叠放都对应一条「先消费后覆写」的流水线约束。`
+        R`依赖顺序是：重算 \(S\) 和 \(P\)；由 P、dO 得到 dV；由 dO、V 得到 dP；再由 P、dP 和行标量 D 得到 dS；最后由 dS 得到 dQ、dK。D 在 preprocess kernel 中提前计算。`,
+        R`若固定 Q，dQ 可本地累加，但 dK、dV 两个张量都要跨 CTA 归约。固定 K 后只剩 dQ 需要全局归约，因此 FFA 选择后者。2-CTA 模式还需要 relay warp，把另一个 CTA 的 dS 就绪信号转发给发射 MMA 的 leader。`,
+        R`16 个 warp 分为 reduce、compute、MMA、load、relay 和空闲角色。TMEM 中 S/P、dP/dS、dQ/dP 会在不同时间复用同一位置，因此每次覆盖前都必须确认旧数据已被消费。`
       ],
       diagram: {
         key: "backward",
@@ -844,8 +844,8 @@
         {
           title: "反向的数学链",
           body: [
-            R`从 \(O = PV\)、\(P = \operatorname{softmax}(Sc)\) 出发,softmax 的雅可比给出核心等式 \(dS = P \odot (dP - D)\),其中 \(D_i = \sum_j P_{ij}\, dP_{ij} = \operatorname{rowsum}(dO_i \odot O_i)\)——第二个等号是关键化简:不需要 P 就能算 D,所以 preprocess 在主 kernel 之前就能完成(Block 01)。若上游还传来 \(d\mathrm{LSE}\)(例如带 z-loss 的训练),只需 \(D' = D - d\mathrm{LSE}\),一并在 preprocess 处理。`,
-            R`scale 的簿记值得单独说:S 的定义带 \(c = \text{softmax\_scale}\),链式法则会在 dQ/dK 上各留一个 \(c\)。实现把它推迟——dS 保持无 scale,dK 在 epilogue 乘 \(c\)(Block 上没展示,行 5598),dQ 在 postprocess 乘 \(c\)(Block 07)——避免在 \(O(n^2)\) 的 dS 上做 \(O(n^2)\) 次乘法,只在 \(O(n d)\) 的输出上乘。`
+            R`记 \(dX\) 为损失对 X 的梯度，\(\odot\) 为逐元素乘法。Softmax 反向可写成 \(dS=P\odot(dP-D)\)，其中每行标量 \(D_i=\sum_jP_{ij}dP_{ij}\)。利用 \(dP=dO\,V^\mathsf{T}\) 和 \(O=PV\)，它又等于 \(\operatorname{rowsum}(dO_i\odot O_i)\)，因此不需要 P 就能在预处理阶段算出。`,
+            R`softmax 缩放系数 \(c\) 最终要乘到 dQ 和 dK。实现不在 \(O(n^2)\) 大小的 dS 上逐元素乘，而是在写出 \(O(nd)\) 大小的 dQ/dK 时再乘，结果相同但工作更少。`
           ],
           formula: R`\[ D = \operatorname{rowsum}(dO \odot O), \qquad P = 2^{\,S c\,-\,\mathrm{LSE}\cdot\log_2 e}, \]
 \[ dV = P^{\mathsf T}\, dO, \qquad dP = dO\, V^{\mathsf T}, \qquad dS = P \odot (dP - D), \]
@@ -855,30 +855,30 @@
         {
           title: "以 K 为家的调度与 warp 分工",
           body: [
-            R`主 kernel 的 work tile 是一个 <strong>n_block</strong>(K tile):K/V 只 load 一次,Q/dO/LSE/dPsum 沿 m_block 流水送入。<code>BlockInfo.get_m_block_min_max</code>(第 3 章的镜像)按 causal 几何裁掉该 K tile 看不到的 Q 区间。`,
-            R`Block 02 列出 5 个 MMA tiler——注意全部写成转置形式(\(S^{\mathsf T} = K Q^{\mathsf T}\)):K 在家、Q 来访,转置让 K 稳坐 A 操作数的 M 维。dV 的 A 来自 TMEM 的 P,dK 的 A 来自 TMEM 的 dS,dQ 的 A 来自 SMEM 的 dS(要跨 CTA 交换,2-CTA 时经 DSMEM all2all)——同一个 dS 按消费者不同走两条路。`,
-            R`Block 04 的软件流水是全 kernel 的心跳:<code>S(i) → dK(i-1) → dQ(i-1) → dP(i) → dV(i)</code>,五个 GEMM 首尾相接,每条注释都在声明「为什么这一步不用等」——全部是从 GEMM 发射顺序推出的免费保证,只有两处真正的 wait:dS 就绪(compute→MMA)与 tdQ 被 reduce 消费(TMEM 复用约束)。`
+            R`一个工作 tile 对应一个 K block（源码称 <code>n_block</code>）。K/V 只加载一次，Q、dO、LSE 和 D 按 Q block（<code>m_block</code>）依次流过。BlockInfo 会跳过当前 K block 无法看到的 Q 范围。`,
+            R`矩阵乘按 \(S^\mathsf{T}=KQ^\mathsf{T}\) 的转置形式组织，使固定的 K 位于主操作数方向。P 和 dS 的部分消费者从 TMEM 读取；dQ 路径需要从 SMEM 读取 dS，以便 2-CTA 时交换数据。`,
+            R`五次 GEMM 交错为 <code>S(i) → dK(i-1) → dQ(i-1) → dP(i) → dV(i)</code>。多数依赖可由同一 MMA warp 的发射顺序保证；显式等待主要用于确认 dS 已生成，以及复用 TMEM 前确认 dQ 已被 reduce warp 读走。`
           ],
           svg: "bwd-tmem"
         },
         {
           title: "softmax 重算与 dS",
           body: [
-            R`Block 05 上半:compute warpgroup 从 TMEM 读 S,一条 packed FMA 完成 \(F = Sc - \mathrm{LSE}\log_2 e\)(LSE 已被 preprocess 预乘 \(\log_2 e\),Block 01 尾部),一条 exp2 得 P,cvt 成 bf16 写回 S 的 TMEM 左半——与前向 P 叠 S 完全同款的复用。`,
-            R`下半:等 dP 的 GEMM 完成,T2R 读 dP,减 dPsum(即 D)、乘 P,得 dS;R2T 写回 dP 的左半(给 dK 用),同时 R2S 写 SMEM(给 dQ 用)。mask 在这里同样只作用于重算的 S(<code>apply_mask_sm100_transposed</code>,swap_AB 版):被 mask 的位置 P=0,dS 自动为 0,梯度天然不泄漏。`,
-            R`与前向的深刻区别:反向<strong>没有 online 递推</strong>——max 基准(LSE)是已知常量,P 一次算对,无 corr_scale、无 correction warp。反向的复杂度全部转移到了「五个 GEMM 的排程」与「dQ 的归约」上。`
+            R`compute warp 从 TMEM 读取 S，计算 \(P=2^{Sc-\mathrm{LSE}\log_2e}\)，再把 bf16 P 写回已经读空的 S 区域。`,
+            R`dP 完成后，代码读取 dP，减去每行的 D，再乘 P 得到 dS。dS 一份写回 TMEM 供 dK 使用，另一份写到 SMEM 供 dQ 使用。被 mask 的位置有 \(P=0\)，因此 dS 也为 0。`,
+            R`反向已知完整行的 LSE，不需要 online 递推，也没有 <code>corr_scale</code> 或 correction warp。主要复杂度转为五次 GEMM 的排程和 dQ 归约。`
           ]
         },
         {
           title: "dQ 归约：atomic 与确定性",
           body: [
-            R`Block 06:reduce warpgroup 等 dQ 的 GEMM 完成,T2R→R2S 后由 TMA warp 发 <code>cp.async.bulk.reduce.add.f32</code>——TMA 引擎直接在 gmem 的 dQaccum 上做原子加,整 tile 一条指令,不占计算线程。`,
-            R`deterministic 的实现哲学:<strong>不取消 atomic,只固定顺序</strong>。每个 (m_block) 配一个信号量,写者按约定的 lock_value 排队:<code>wait_eq(sem, lock)</code> → TMA reduce → <code>arrive_inc</code> 放行下一个。lock 顺序默认按 n_block 递增;causal+SPT 时反转(与 LPT 调度器的遍历方向一致);block-sparse 时由 host 预算的 <code>dq_write_order</code> 表给出。fp32 加法固定顺序 ⇒ 结果 bit 级可复现。代价是写者串行化——所以 deterministic 配套 LPT/head_swizzle 调度,让「同一 m_block 的写者们」尽量错峰到达。`,
-            R`Block 07 的 postprocess 收尾:dQaccum(fp32,含全部贡献)→ 乘 softmax_scale → cast 到 bf16 → 经 SMEM 重排后合并写出。dK/dV 不需要这一步——它们在 TMEM 累加完就地转 dtype 写出(GQA 的多 Q-head 归约是例外,走各自的 fp32 accum + semaphore)。`
+            R`dQ GEMM 完成后，reduce warp 把 tile 从 TMEM 搬到 SMEM，再由 TMA 对全局内存中的 fp32 <code>dQaccum</code> 做批量原子加。`,
+            R`确定性模式为每个 Q block 配置信号量。写者按预定顺序执行“等待→原子加→放行下一位”，使 fp32 加法顺序固定，从而获得 bit 级可复现结果。代价是同一 Q block 的写者必须串行。`,
+            R`postprocess 最后把 <code>dQaccum</code> 乘 softmax scale，再转换为输出 dtype。dK/dV 已在当前 CTA 内累加完成，通常可直接写出；GQA 的多 Q-head 归约是例外。`
           ]
         }
       ],
-      warning: R`「deterministic=True 消除了 atomic」是最常见的误读——原子加仍在，被固定的只是顺序。另外反向的 mask 是 <code>swap_AB</code> 版本（S 转置布局），行列角色互换；直接搬用前向 mask 的坐标公式会得到转置的错误结果。`,
+      warning: R`<code>deterministic=True</code> 不会取消原子加，只会固定原子加顺序。反向按 \(S^\mathsf{T}\) 布局工作，mask 的行列已交换，不能直接复制前向坐标公式。`,
       exercises: [
         {
           kind: "推导", level: "基础",
@@ -914,7 +914,7 @@
           kind: "设计", level: "挑战",
           q: R`GQA(qhead_per_kvhead=8)时,8 个 Q head 的 dK/dV 贡献落到同一个 KV head 上。源码走「fp32 accum + 可选 semaphore」的 dKV_postprocess 路径。设计一个免全局归约的替代方案并分析代价。`,
           hint: R`归约的另一个维度是「调度」:能否让同一 KV head 的 8 个 Q head 由同一 CTA 处理？`,
-          answer: R`替代方案:把 (n_block, kv_head) 作为 work tile,CTA 内沿 Q-head 维内层循环——8 个 Q head 的 dS 依次流过,dK/dV 在 TMEM 上跨 head 连续累加,写出时已是完整和,无需 atomic。代价:(1) 单 tile 工作量 ×8,persistent 负载粒度变粗,尾部均衡变差(可用 CLC 缓解);(2) Q/dO 的 load 量不变但访问跨 head 步长大,L2 亲和下降;(3) 寄存器/SMEM 中 LSE、dPsum 要按 head 轮换,流水线 stage 数受挤压。本质是拿「调度自由度」换「归约流量」——与前向 PackGQA 把 head 折进 seqlen 维是同一枚硬币的两面。`
+          answer: R`可把 (n_block, kv_head) 作为 work tile，并在一个 CTA 内依次处理 8 个 Q head。这样 dK/dV 可跨 head 留在 TMEM 中累加，最后一次写出，无需全局原子归约。代价是：单 tile 工作量增至 8 倍，任务粒度更粗；跨 head 访问可能降低 L2 局部性；LSE 和 D 需要按 head 轮换，可能减少流水线 stage。这个方案用较少归约换取较少调度自由度。`
         }
       ],
       sources: [
@@ -939,17 +939,17 @@
       category: "hybrid",
       difficulty: "挑战",
       source: "functional/dist_attn.py · 3806 行",
-      deck: R`前八章的 kernel 无论多快，只解决单卡问题；百万 token 的序列必须切到几十上百个 CP rank 上，而注意力天生要「看见别人的 KV」。本章读 MagiAttention 分布式的心脏 <code>DistAttnRuntime</code>：GroupCast/GroupReduce 两条通信原语、多阶段 overlap 流水线、以及 <code>sm_margin</code> / KernelBarrier 这两种让通信 kernel 与 persistent 计算 kernel 分享 GPU 的方式——第 0 章埋下的每一个伏笔（可合并的 out/lse、sm_margin、GroupReduce）都在这里兑现。`,
-      takeaway: R`通算融合的完整公式是<strong>「切阶段 + 三重奏 + 让 SM」</strong>：把远端 KV 按 overlap solver 的成本模型切成 \(d\) 个 stage；每个时刻让三件事并行——<strong>第 \(i{+}1\) 段的 GroupCast 预取、第 \(i\) 段的 FFA partial attention、第 \(i{-}1\) 段的归约</strong>；而这一切能真正并行的物理前提，是 FFA persistent kernel 通过 <code>sm_margin</code> 给通信 kernel 留出 SM（或 native grpcoll 用 KernelBarrier 保证发射顺序）。归约本身零成本创新：kernel 的 atomic 累加缓冲（<code>out_acc/lse_acc</code>）直接吃掉第 0 章的半群合并公式。`,
+      deck: R`CP（context parallelism）把长序列分到多个进程，进程在代码中称为 rank。每个 rank 持有部分 Q/K/V，但计算本地 Q 时可能需要远端 K/V。本章说明数据如何按需发送、局部结果如何合并，以及通信如何与计算重叠。`,
+      takeaway: R`整体流程只有三步：把远端 KV 切成多个 stage；计算第 \(i\) 段时预取第 \(i+1\) 段，并处理第 \(i-1\) 段结果；最后给通信 kernel 留出可运行的 SM。只有队列异步和硬件资源都满足，时间线才会真正重叠。`,
       intuitions: [
-        { label: "原语", title: "GroupCast / GroupReduce", body: R`「一段数据发给多个 rank」与「多段 partial 结果按半群归约到属主」——不规则 mask 的通信不再是 ring，而是按依赖精确投递。` },
-        { label: "流水", title: "三重奏错峰", body: R`prefetch(i+1) ∥ compute(i) ∥ reduce(i−1)：通信藏进计算的影子里,理想情况下端到端时间 = max(通信,计算) 而非两者之和。` },
-        { label: "地皮", title: "SM 是要分的", body: R`NCCL/native 通信 kernel 也要 SM。persistent 的 FFA kernel 少开 sm_margin 个 CTA,通信才有地皮真正并行——overlap 不是免费的时间魔法。` }
+        { label: "通信", title: "按依赖发送和归约", body: R`GroupCast 把一段数据发给多个需要它的 rank；GroupReduce 把多个 rank 的局部结果送回属主并合并。` },
+        { label: "流水", title: "三拍并行", body: R`理想状态下同时执行 prefetch(i+1)、compute(i)、reduce(i−1)，每拍耗时接近通信与计算中的较大者。` },
+        { label: "资源", title: "异步不等于能同时运行", body: R`通信 kernel 也需要 SM。计算 kernel 若占满 GPU，通信即使已异步入队，也可能只能排队等待。` }
       ],
       motivation: [
-        R`Ring-Attention 一类环形 CP 方案假设每个 rank 需要「按固定拓扑轮转」所有 KV——对规则的 full/causal mask 尚可,对 Magi-1 的 varlen block-causal 这类<strong>不规则 mask</strong>会产生大量无效通信：很多 (Q,K) 对根本不在 mask 里,却仍要跟着环转一整圈。MagiAttention 的答案与 kernel 侧一脉相承：先用 AttnSlice 把依赖精确化（第 0 章）,dispatch solver 均衡负载后,每个 rank 需要哪些远端 KV 是一张<strong>精确的清单</strong>——通信原语只需按清单投递。这就是 GroupCast（KV 去程）与 GroupReduce（partial 结果回程）。`,
-        R`有了原语还不够：一次性拉全所有远端 KV 再计算,通信完全暴露在关键路径上。<code>DistAttnRuntime</code> 把远端 KV 切成 <code>overlap_degree</code> 个 stage 组成流水线,用异步句柄 <code>WorkWithPostProcessFn</code> 把「等通信」推迟到「真正要用那份数据的前一刻」。切几段、每段装哪些 rank 的数据,由 <code>OverlapSolver</code> 按成本模型求解——这是一个和第 6 章 LPT 同款的「调度问题」,只是排的不是 CTA 而是通信段。`,
-        R`最后一块拼图在 GPU 内部：通信 kernel（NCCL 的 a2av 或 native grpcoll 的收发 kernel）与计算 kernel 抢 SM。若 FFA kernel 占满全部 SM,异步发出的通信会被排队到计算之后——overlap 名存实亡。所以第 0 章见过的 <code>sm_margin</code> 在这里揭晓真身：FFA persistent kernel 故意少开若干 CTA,把 SM 留给通信;而 native grpcoll 路径反其道行之——通信 kernel 常驻 SM,用 <code>KernelBarrier</code> 计数器保证「先发射的计算 kernel 先拿到地皮」,此时 sm_margin 归零。`
+        R`环形方案通常让 KV 按固定拓扑依次经过各 rank。遇到不规则 mask 时，许多根本不会参与计算的 KV 也会被传输。MagiAttention 先由 AttnSlice 得出精确依赖清单，只把某段 KV 发给真正需要它的 rank。`,
+        R`若先收齐全部远端 KV 再计算，通信时间会完整暴露。<code>DistAttnRuntime</code> 将远端 KV 切成多个 stage，并把等待推迟到该 stage 真正要使用前。<code>OverlapSolver</code> 根据通信量和计算量选择切分方式。`,
+        R`GPU 内部还要分配执行资源。NCCL 或 native grpcoll 的通信 kernel 都要占 SM。NCCL 路径用 <code>sm_margin</code> 让 FFA 少启动若干 CTA；native grpcoll 使用常驻通信 kernel，并以 <code>KernelBarrier</code> 协调发射顺序。`
       ],
       diagram: {
         key: "overlap",
@@ -959,44 +959,44 @@
         {
           title: "GroupCast / GroupReduce：为不规则依赖定制的集合通信",
           body: [
-            R`两条原语的签名是理解一切的起点（Block 04）。<strong>group_cast</strong>：输入张量按 <code>input_split_sizes</code> 切段,每段带一个目的 rank 列表 <code>dst_indices[i]</code>（可多播）;输出侧 <code>output_split_sizes + src_index</code> 描述收到的段从谁来、按什么顺序排。<strong>group_reduce</strong> 是它的对偶（Block 05）：每段带一个目的 rank（<code>dst_index</code>）,属主侧按 <code>src_indices</code> 把多个来源的同一段<strong>归约</strong>——reduce_op 除了 sum/avg,还有专为注意力设计的 <code>"lse"</code>：用第 0 章的合并公式做 log-sum-exp 加权平均。`,
-            R`默认实现把 group_cast <strong>降解到 NCCL all2all_v</strong>（Block 06）：多播段先在本地复制展开成「每个目的 rank 一份」的连续发送缓冲,a2av 一发;接收侧因为「同源段保序」,只需一次索引重排——这个重排被打包成 <code>post_process_fn</code>,挂在异步句柄上,等待完成后才执行。group_reduce 同理降解：a2av 收齐各来源的 partial 段,post-process 里做本地 sum/lse 归约。代价是显式的 pack/unpack 拷贝与多播复制——这正是 native grpcoll 存在的理由。`,
-            R`<strong>native grpcoll</strong>（DeepEP 风格,Block 04 的第二分支）用 NVLink/RDMA 对称缓冲区直接做多播与归约,省去 pack/unpack,fp32 归约在通信 kernel 内完成（<code>comm_dtype</code> 可低精度传输、高精度累加）;<strong>hierarchical</strong> 分支把「节点内多播」与「跨节点传输」拆成两级 a2av,同一段数据跨节点只走一次 RDMA,到达后再在节点内 NVLink 扇出——三种实现共用一个签名,对上层 <code>DistAttnRuntime</code> 完全透明。`
+            R`<strong>group_cast</strong> 先按 <code>input_split_sizes</code> 切段，再用 <code>dst_indices[i]</code> 指定每段要发给哪些 rank。<strong>group_reduce</strong> 做反向操作：把多个来源的对应段送回属主，并按 sum、avg 或注意力专用的 <code>"lse"</code> 规则合并。`,
+            R`默认 NCCL 实现会先把多播数据打包成每个目标 rank 一份，再调用变长 all-to-all（a2av）。接收后执行索引重排；group_reduce 则在接收后做本地 sum/LSE 合并。这条路径简单通用，但需要额外 pack/unpack。`,
+            R`<strong>native grpcoll</strong> 直接在 NVLink/RDMA 对称缓冲区中多播和归约，减少中间拷贝。<strong>hierarchical</strong> 路径先跨节点传一次，再在目标节点内扇出。三种实现使用相同接口。`
           ],
-          formula: R`<p>group_reduce 的 <code>"lse"</code> 归约在通信层复用第 0 章的半群公式：属主收到 \(r\) 个 partial \((out_k, lse_k)\) 后计算</p>
+          formula: R`<p>group_reduce 的 <code>"lse"</code> 归约复用第 0 章的结果合并公式。属主收到 \(r\) 个局部结果 \((out_k,lse_k)\) 后计算</p>
 \[ \mathrm{lse} = \log\!\sum_k e^{\mathrm{lse}_k}, \qquad \mathrm{out} = \sum_k e^{\mathrm{lse}_k - \mathrm{lse}}\, out_k . \]
-<p>交换律 + 结合律意味着：段怎么切、先到后到、在 kernel 里归约还是在通信里归约,结果数学上同一——这是整个多阶段流水线可以任意重排的根本许可。</p>`
+<p>实数运算下该操作满足交换律和结合律，因此可以分阶段合并。实际浮点结果仍可能随归约顺序产生微小舍入差异。</p>`
         },
         {
           title: "多阶段 overlap 环：prefetch / compute / reduce 三重奏",
           body: [
-            R`<code>DistAttnFunc.forward</code>（Block 01）是一台精确的三拍机器。<strong>host stage</strong>：先发起 stage-0 的远端 KV 预取,立即用本地 KV 算 partial attention——第一段通信藏在本地计算后面。<strong>主环</strong>第 \(i\) 拍做三件事：① <code>get_curr_q_kv_and_fetch_next</code> 等 stage-\(i\) 的 KV 到位、同时发起 stage-\(i{+}1\) 的预取（Block 02）;② 用 stage-\(i\) 的远端 KV 发射 FFA kernel;③ 把 stage-\(i{-}1\)（FFA 后立即）的 partial 结果交给 <code>reduce_partial_out_lse</code> 异步归约。三类工作分别压在通信流、计算流上,互相只以「异步句柄 + 等待点」耦合。`,
-            R`归约有一个优雅的零通信特例：默认（KV 走通信,Q 不动）模式下,每个 rank 算的都是<strong>自己的 Q</strong> 对不同 KV 段的 partial 结果——它们本来就在本地！FFA backend 直接把上一拍的 \((out, lse)\) 作为 <strong>累加缓冲</strong>（<code>out_acc/lse_acc</code>）传入 kernel（Block 07）：atomic 归约在 kernel 尾声完成合并,连 <code>correct_attn_out_lse</code> 的显式调用都省了。GroupReduce 真正出场是在两处：反向的 dKV 必须回到 KV 属主（sum 归约）,以及开启 qo_comm 时 partial out/lse 回到 Q 属主（lse 归约）。`,
-            R`预取的姿势由 <code>prefetch_stage_by_stage</code> 决定（Block 03）：默认在 host stage 一次把<strong>所有</strong> stage 的 group_cast 全部发出——persistent kernel + sm_margin 保证它们与后续计算并行;但当 <code>CUDA_DEVICE_MAX_CONNECTIONS=1</code>（硬件队列只有一条,先入队者阻塞后来者）或 native grpcoll（缓冲区按 stage 复用,不能同时在飞）时,退化为逐 stage 预取——每拍只提前一步。这是「调度自由度」与「资源占用」的经典折衷。`
+            R`开始时先预取 stage 0，同时用本地 KV 计算。主循环第 \(i\) 拍：等待 stage \(i\) 到位并预取 \(i+1\)；用 stage \(i\) 启动 FFA；把上一拍结果交给异步归约。通信流与计算流只在必要等待点同步。`,
+            R`默认 KV-comm 模式下，Q 留在本 rank，不同 KV stage 的局部 out/LSE 也都留在本地。backend 可把上一拍结果作为 <code>out_acc/lse_acc</code> 传给后续 kernel 合并。真正跨网络的 GroupReduce 主要用于反向 dKV，或 qo_comm 模式下把局部 out/LSE 送回 Q 属主。`,
+            R`通常可提前发出多个 stage 的预取。但当 <code>CUDA_DEVICE_MAX_CONNECTIONS=1</code> 或 native grpcoll 复用同一缓冲区时，只能逐 stage 预取，以免队列阻塞或缓冲区冲突。`
           ],
           svg: "overlap-timeline"
         },
         {
           title: "OverlapSolver：切几段、每段装什么",
           body: [
-            R`<code>OverlapConfig.degree</code> 的语义谱系（Block 08）值得背下来：<code>degree=0</code> 完全不 overlap——阻塞式 group_cast 拉全 KV、拼接后<strong>一次</strong> FFA 调用,换来的是彻底绕开 LSE 合并的精度损失（校验用基线）;<code>degree=1</code> 本地 + 1 个远端段（通信只能藏在 host 计算后面）;<code>degree=N</code> 静态多段;<code>degree=None</code> 动态模式——solver 逐个 degree 试解,取总时延最短者。`,
-            R`成本模型（Block 09）把每个候选 chunk 记为 \((C^{\mathrm{comm}}_j, C^{\mathrm{calc}}_j)\)（通信量与 mask 面积各乘一个标定系数）,一个划分方案的总时延按「第 \(i\) 段通信与第 \(i{-}1\) 段计算完美互相掩盖」的假设估算（下方公式）。当前默认解法是朴素的均匀划分（<code>UniformOverlapAlg</code>）,贪心解法留着 TODO——但框架已把「求最优 stage 划分」形式化成了与第 6 章 LPT 同类的 makespan 极小化问题。`,
-            R`划分的粒度下界由 <code>min_chunk_size=512</code>、<code>max_num_chunks=64</code> 控制：段切太碎,每段的 kernel 发射开销与 a2av 固定延迟会吃掉 overlap 的收益;切太粗,首段通信藏不进 host 计算。这组超参与 kernel 侧 tile=128 的角色完全同构——流水线的深度与粒度永远是一对矛盾。`
+            R`<code>degree=0</code> 表示先阻塞式拉取全部 KV，再调用一次 FFA，可作为不做 LSE 分段合并的校验基线；<code>degree=1</code> 表示一个远端段；正整数 N 表示固定切 N 段；<code>None</code> 让 solver 比较多个 degree。`,
+            R`对候选 chunk \(j\)，\(C_j^{\mathrm{comm}}\) 表示估计通信时间，\(C_j^{\mathrm{calc}}\) 表示估计计算时间。模型假设第 \(i\) 段通信可与第 \(i-1\) 段计算重叠，并据此估算总时延。当前默认算法做均匀划分。`,
+            R`段太碎会增加 kernel 发射和 a2av 固定开销；段太粗又难以把首段通信藏进本地计算。因此 <code>min_chunk_size</code> 和 <code>max_num_chunks</code> 同时限制切分粒度。`
           ],
-          formula: R`<p>overlap 划分 \(\{P_0,\dots,P_{d-1}\}\) 的总时延估计（<code>OverlapSolver._calc_overall_cost</code>）：</p>
+          formula: R`<p>设远端数据被切成 \(d\) 个 stage，\(P_i\) 是第 \(i\) 个 stage 包含的 chunk 集合；\(C_j^{\mathrm{comm}}\) 和 \(C_j^{\mathrm{calc}}\) 分别是 chunk \(j\) 的估计通信、计算时间；\(C_{\mathrm{host}}^{\mathrm{calc}}\) 是本地 KV 的计算时间。总时延估计为：</p>
 \[ T \;=\; \max\!\Big(\textstyle\sum_{j\in P_0} C^{\mathrm{comm}}_j,\; C^{\mathrm{calc}}_{\mathrm{host}}\Big) \;+\; \sum_{i=1}^{d-1}\max\!\Big(\textstyle\sum_{j\in P_i} C^{\mathrm{comm}}_j,\; \sum_{j\in P_{i-1}} C^{\mathrm{calc}}_j\Big) \;+\; \sum_{j\in P_{d-1}} C^{\mathrm{calc}}_j . \]
-<p>每一项都是 \(\max(\text{通信}_i, \text{计算}_{i-1})\)——相邻拍完美互掩的假设。理想的解让每个 \(\max\) 的两个参数相等：通信恰好被计算填满,首段通信恰好被 host 计算填满,只有最后一段计算裸露。这正是「线性可扩展」的数学条件：只要每 rank 的计算量随 CP 度不变（dispatch 均衡）且通信不超过计算,总时延与 CP 度无关。</p>`
+<p>每个 \(\max\) 表示同一拍中的通信和计算并行，较慢的一项决定该拍时长。该公式是理想模型：它没有显式计入队列阻塞、固定发射开销和资源竞争，这些因素需要实测校准。</p>`
         },
         {
           title: "SM 的分配：sm_margin 与 KernelBarrier",
           body: [
-            R`异步 ≠ 并行。NCCL 的 a2av 也是 GPU kernel,要拿到 SM 才开始搬数据;FFA 是 persistent kernel（第 6 章）,默认按「每 SM 一个 CTA」铺满整卡。若不干预,通信 kernel 只能排在 FFA 之后——nsys 时间线上是「串行的两段」,overlap 完全落空。<code>fwd_sm_margin</code>（Block 03）是解法一：host 侧把 <code>sm_count - margin</code> 传给 tile scheduler,FFA 少开 margin 个 CTA,通信 kernel 从发射起就有地皮,真正与计算并行。margin 大小由环境变量标定——留太多,计算变慢;留太少,通信带宽上不去,是一个按硬件与模型形状实测的旋钮。`,
-            R`native grpcoll 是解法二,哲学相反：通信 kernel 自己常驻 SM（<code>GrpCollConfig.num_sms</code>,默认 24,每 2 个 SM 一条 channel）,反而是<strong>发射顺序</strong>变成新风险——通信 kernel 若先于它依赖的计算 kernel 拿到 SM,会空转占地皮甚至死锁。<code>KernelBarrier</code>（Block 01 开头）是一个 GPU 上的计数器：计算 kernel 尾声 arrive,通信 kernel 开头 spin-wait 到目标值——用微型的「kernel 间 mbarrier」把发射顺序钉死,于是 <code>fwd_sm_margin</code> 返回 0：地皮已由通信 kernel 自带,无需再留。`,
-            R`反向把同样的机器再跑一遍,多两个角色：dKV 的 GroupReduce（sum,回 KV 属主）与 dQ 本地累加,而且尾巴上有一个专门的优化——最后一个 stage 的 dKV 归约没有后续计算可掩,<code>save_tail_stage</code> 把前向存下的末段 KV 让反向「借尸还魂」：调换计算顺序,让末段归约与下一层的反向计算重叠（<code>_hide_tail_stage_reduce_backward</code>）。通算融合的每一处细节都在重复同一句话：<strong>找到还没被占用的影子,把通信塞进去</strong>。`
+            R`NCCL a2av 也是 GPU kernel。若 persistent FFA 占满所有 SM，通信会等计算结束。<code>fwd_sm_margin</code> 让 FFA 少启动若干 CTA，给通信保留资源。margin 太大会拖慢计算，太小又不足以支撑通信带宽，因此必须按硬件和形状实测。`,
+            R`native grpcoll 使用固定数量的常驻通信 SM。此时主要风险变成发射顺序：通信 kernel 不能在依赖的计算尚未完成时占住资源等待。<code>KernelBarrier</code> 用 GPU 计数器协调两类 kernel，因此这条路径不再额外设置 <code>fwd_sm_margin</code>。`,
+            R`反向还需要把 dKV 按 sum 归约回属主。最后一个 stage 没有后续本层计算可用于遮蔽，<code>save_tail_stage</code> 会调整顺序，尝试让这段尾部归约与下一层反向计算重叠。`
           ]
         }
       ],
-      warning: R`不要把「overlap_degree 越大越好」当作结论——每加一段就多一次 kernel 发射、一次 a2av 固定延迟、一份 grpcoll 缓冲;当单段通信时间已小于计算时,加段只增开销。也不要混淆两条归约路径：默认 KV-comm 模式下前向的 out/lse 合并<strong>不走网络</strong>（kernel 累加缓冲完成）,GroupReduce 的网络流量在反向 dKV 与 qo_comm 模式——引用「通信量」数据时务必注明模式。`,
+      warning: R`<code>overlap_degree</code> 不是越大越好。每多一段都会增加一次发射、固定通信延迟和缓冲需求。还要区分模式：默认 KV-comm 的前向 out/LSE 在本地合并；反向 dKV 和 qo_comm 才使用网络 GroupReduce。`,
       exercises: [
         {
           kind: "概念", level: "基础",
