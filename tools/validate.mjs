@@ -29,8 +29,27 @@ const AUX_KEYS = new Set([
   "overlap-degree-schedule", "overlap-degree-causal"
 ]);
 
+/* Chapter bodies are injected as raw HTML: a bare '<' followed by a letter
+ * (e.g. KaTeX "\(L<d\)") starts an HTML tag and silently swallows content.
+ * Only whitelisted plain tags may appear; math must use \lt / &lt;. */
+const RAW_TAG_ALLOW = /^<(code|strong|em|p|ol|ul|li|br|b|i|span|sup|sub|div)$/;
+function scanRawHtml(value, where) {
+  if (typeof value === "string") {
+    for (const match of value.matchAll(/<[A-Za-z][^>\s]*/g)) {
+      if (!RAW_TAG_ALLOW.test(match[0])) {
+        errors.push(`${where}: bare '<' breaks HTML parsing near "${match[0]}" (use \\lt or &lt;)`);
+      }
+    }
+  } else if (Array.isArray(value)) {
+    for (const item of value) scanRawHtml(item, where);
+  } else if (value && typeof value === "object") {
+    for (const item of Object.values(value)) scanRawHtml(item, where);
+  }
+}
+
 for (const chapter of MAGI_CHAPTERS) {
   const where = `chapter ${chapter.id}`;
+  scanRawHtml(chapter, where);
   check(chapter.order >= 0, `${where}: order`);
   check(chapter.takeaway && chapter.takeaway.length > 40, `${where}: takeaway too short`);
   check((chapter.intuitions || []).length === 3, `${where}: expect 3 intuition cards`);

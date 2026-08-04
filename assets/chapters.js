@@ -44,7 +44,7 @@
           title: "AttnSlice 三元组与四种 mask 几何",
           body: [
             R`<code>AttnMaskType</code> 定义四种矩形内部的形状：<code>FULL</code> 全部有效；<code>CAUSAL</code> 保留下三角；<code>INVCAUSAL</code> 保留上三角；<code>BICAUSAL</code> 取上下三角的交集。这里的“右下对齐”表示 Q 和 K 的末尾对齐，“左上对齐”表示二者开头对齐。`,
-            R`设切片有 \(s_q\) 行 Q、\(s_k\) 列 K。若两者长度不同，对齐方向会改变三角形的位置。例如 \(s_q<s_k\) 时，右下对齐的 CAUSAL 区域会变成梯形。先明确长度和对齐方向，再看公式，就不会把它误认为普通的 \(k\le q\)。`,
+            R`设切片有 \(s_q\) 行 Q、\(s_k\) 列 K。若两者长度不同，对齐方向会改变三角形的位置。例如 \(s_q \lt s_k\) 时，右下对齐的 CAUSAL 区域会变成梯形。先明确长度和对齐方向，再看公式，就不会把它误认为普通的 \(k\le q\)。`,
             R`全局 mask 就是所有切片有效位置的并集。切片允许重叠，因此同一 Q 行可能得到多份局部结果；这些结果需要在最后合并。`
           ],
           svg: "attnslice-masktypes",
@@ -450,7 +450,7 @@
           kind: "源码", level: "进阶",
           q: R`R2P 掩码函数 <code>mask_r2p_lambda</code> 里，为什么内层循环必须使用编译期范围 <code>range_constexpr</code>？如果写成运行时循环会怎样？`,
           hint: R`R2P 指令的语义是「寄存器位 → 谓词寄存器」。`,
-          answer: R`R2P 要求编译器在编译期知道「哪一位对应哪条 SEL」，才能把 <code>mask & (1<<i)</code> 的序列模式识别成一条 R2P + 谓词化 SEL 序列。运行时循环里 i 是变量，每次迭代都是独立的移位+测试+分支，编译器只能生成逐元素代码——不仅没有 R2P，还多了循环开销。「编译期展开是优化的启用条件」是 CuTe DSL 编程的普遍规律。`
+          answer: R`R2P 要求编译器在编译期知道「哪一位对应哪条 SEL」，才能把 <code>mask &amp; (1&lt;&lt;i)</code> 的序列模式识别成一条 R2P + 谓词化 SEL 序列。运行时循环里 i 是变量，每次迭代都是独立的移位+测试+分支，编译器只能生成逐元素代码——不仅没有 R2P，还多了循环开销。「编译期展开是优化的启用条件」是 CuTe DSL 编程的普遍规律。`
         },
         {
           kind: "系统", level: "进阶",
@@ -1019,7 +1019,7 @@
         {
           title: "causal 的每一拍：不等长接收列与空拍",
           body: [
-            R`<strong>causal 会同时破坏 full 的两种均匀性。</strong>在连续分片的教学假设下，chunk 顺序为 \(c_0<\cdots<c_7\)，rank \(r\) 持有 \(c_{2r},c_{2r+1}\)。当 \(CP=4\) 时，四个 rank 的远端接收列长度依次为 0/2/4/6 个 chunk，这是 rank 之间的第一重不均；同一接收列内，各 chunk 的计算量又随 causal mask 面积而异，越靠前的 chunk 被越多 Q 行依赖。于是 rank 3 不仅接收最多，也承担最多计算。`,
+            R`<strong>causal 会同时破坏 full 的两种均匀性。</strong>在连续分片的教学假设下，chunk 顺序为 \(c_0 \lt \cdots \lt c_7\)，rank \(r\) 持有 \(c_{2r},c_{2r+1}\)。当 \(CP=4\) 时，四个 rank 的远端接收列长度依次为 0/2/4/6 个 chunk，这是 rank 之间的第一重不均；同一接收列内，各 chunk 的计算量又随 causal mask 面积而异，越靠前的 chunk 被越多 Q 行依赖。于是 rank 3 不仅接收最多，也承担最多计算。`,
             {
               card: true,
               tone: "recipe",
@@ -1066,7 +1066,7 @@
               body: [
                 R`<code>stage_costs</code> 的第 0 项是 host 本地计算，后面是按自然顺序排列的远端 chunk。默认 <code>random_costs=false</code>；开启后只先打乱远端项，再把 host 放回清单最前，因此 host 始终位于 <code>partition 0</code> 并占一个名额。`,
                 R`设远端项数为 \(L\)、请求 degree 为 \(d\)。源码先取有效切分段数 \(d_{\mathrm{eff}}=\min(d,L)\)；当 \(L>0\) 时，把 \(L+1\) 个清单项分成 \(d_{\mathrm{eff}}\) 组，每组先取 \(\lfloor(L+1)/d_{\mathrm{eff}}\rfloor\) 项，余下的 \((L+1)\bmod d_{\mathrm{eff}}\) 项从前往后各组多摊 1 项。host 因而固定挤掉第 0 拍的一个远端名额。`,
-                R`当 \(L<d\) 时，<code>overlap_degree_idle=d-L</code> 个空分组追加在 <code>partitions</code> 末尾，使结果仍有全局一致的 \(d\) 拍；\(L=0\) 时只有 host 留在第 0 分组，其余视图全为空拍。源码 docstring 将 uniform 明确称为 “a dummy but feasible solution ... instead of production”；<code>greedy</code> 是按估计耗时装箱的备选算法。`
+                R`当 \(L \lt d\) 时，<code>overlap_degree_idle=d-L</code> 个空分组追加在 <code>partitions</code> 末尾，使结果仍有全局一致的 \(d\) 拍；\(L=0\) 时只有 host 留在第 0 分组，其余视图全为空拍。源码 docstring 将 uniform 明确称为 “a dummy but feasible solution ... instead of production”；<code>greedy</code> 是按估计耗时装箱的备选算法。`
               ]
             },
             R`host 占位使第 0 拍少装一个远端 chunk，正好对应前文三步口诀中的“拍 0 轻一格”：首拍通信只能由 host 计算遮蔽。uniform 平衡的是清单项数和近似通信量，不保证由 mask 面积决定的计算耗时相等；因此相同 chunk 数的两拍仍可能成为不同长度的关键路径。`,
