@@ -91,14 +91,14 @@
         {
           kind: "推导", level: "进阶",
           q: R`证明 LSE 合并公式的数值安全性：为什么实现写成 \(\max + \operatorname{softplus}(\min-\max)\) 而不是直接 \(\log(e^{l_1}+e^{l_2})\)？当 \(l_1 = -\infty\) 时会发生什么？`,
-          hint: R`考虑 \(l_i \approx 80\)（bf16 训练常见量级）时 \(e^{l_i}\) 的表示范围，以及 softplus 在 \(-\infty\) 处的取值。`,
+          hint: R`考虑 \(l_i \approx 80\) 时 \(e^{l_i}\) 的表示范围。这里 \(\operatorname{softplus}(x)=\log(1+e^x)\)，且 \(\operatorname{softplus}(-\infty)=0\)。`,
           answer: R`\(e^{80}\approx 5.5\times10^{34}\) 在 fp32 中仍可表示，但 fp32 的自然指数约在 \(x>88.7\) 时上溢，因此直接计算依赖 LSE 的绝对大小。改写后唯一的指数项满足 \(e^{\min-\max}\le 1\)，不会上溢。当 \(l_1=-\infty\) 时，公式退化为 \(\mathrm{lse}=l_2\)，说明空集是合并单位元。源码中的 <code>safe_subtract</code> 还避免了 \(-\infty-(-\infty)\) 产生 NaN。`
         },
         {
           kind: "推导", level: "进阶",
           q: R`设一个 Q token 被 3 个重叠切片覆盖，各切片 partial 结果为 \((out_i, lse_i)\)。写出合并后的 \(out\)，并证明它等于「把三个切片的 K 集合并起来做一次完整 softmax」的结果（假设 K 集合两两不相交）。`,
-          hint: R`把每个 \(out_i\) 写成 \(\frac{\sum_{k\in K_i} e^{s_k} v_k}{e^{lse_i}}\)。`,
-          answer: R`\(out = \sum_i w_i\, out_i\)，\(w_i = e^{lse_i - lse}\)，\(lse = \log\sum_i e^{lse_i}\)。代入 \(out_i = e^{-lse_i}\sum_{k\in K_i} e^{s_k}v_k\) 得 \(out = e^{-lse}\sum_i \sum_{k\in K_i} e^{s_k} v_k\)，而 \(e^{lse} = \sum_i e^{lse_i} = \sum_{k\in\cup K_i} e^{s_k}\)。两者合起来正是全集 softmax 的定义。K 集不相交保证分子分母都不重复计数。`
+          hint: R`用 \(z_{qk}\) 表示 Q 行 \(q\) 与 K 列 \(k\) 的 attention score，把每个 \(out_i\) 写成 \(\frac{\sum_{k\in K_i} e^{z_{qk}} v_k}{e^{lse_i}}\)。`,
+          answer: R`\(out = \sum_i w_i\, out_i\)，\(w_i = e^{lse_i-lse}\)，\(lse = \log\sum_i e^{lse_i}\)。代入 \(out_i=e^{-lse_i}\sum_{k\in K_i}e^{z_{qk}}v_k\)，得到 \(out=e^{-lse}\sum_i\sum_{k\in K_i}e^{z_{qk}}v_k\)；同时 \(e^{lse}=\sum_i e^{lse_i}=\sum_{k\in\cup K_i}e^{z_{qk}}\)。这正是对全部 K 做一次 softmax。K 集不相交可保证分子、分母都不重复计数。`
         },
         {
           kind: "源码", level: "进阶",
@@ -174,9 +174,9 @@
             R`tcgen05 指令由 MMA warp 中一个被选中的线程发射，随后异步执行，并在完成时更新 mbarrier。warpgroup 指 4 个 warp、共 128 个线程；与需要整个 warpgroup 参与的 Hopper WGMMA 相比，Blackwell 的发射端更轻。`,
             R`在 2-CTA 模式下，只有 leader CTA 发射指令，但硬件会读取两个 CTA 的 SMEM。两个 CTA 最终各得到自己的 128 行结果。`
           ],
-          formula: R`<p>一个 Q tile（q_stage=2 展开前的单 stage）在 TMEM 里完成的计算：</p>
+          formula: R`<p>设 \(i\) 表示 Q stage，\(j\) 表示当前 KV block。一个 Q tile 在 TMEM 中完成：</p>
 \[ \underbrace{S_i}_{\mathrm{TMEM}[0,128)} = \underbrace{Q_i}_{\mathrm{SMEM}} \underbrace{K_j^{\mathsf T}}_{\mathrm{SMEM}}, \qquad \underbrace{O_i}_{\mathrm{TMEM}[256,384)} \mathrel{+}= \underbrace{P_{ij}}_{\mathrm{TMEM}[64,192)} \underbrace{V_j}_{\mathrm{SMEM}} . \]
-<p>其中 \(P_{ij}\) 由 softmax warp 以 bf16 写回。O 在整个 KV 循环中驻留 TMEM 持续累加，只在末尾被 correction 读出一次。</p>`
+<p>\(P_{ij}\) 是 Q stage \(i\) 对 KV block \(j\) 的概率块，由 softmax warp 以 bf16 写回。\(O_i\) 在整个 KV 循环中驻留 TMEM，持续累加各个 \(j\) 的贡献。</p>`
         },
         {
           title: "TMA：搬运即记账",
@@ -329,7 +329,7 @@
           kind: "源码", level: "进阶",
           q: R`主循环里 correction 修正 O(i-1) 时不等任何 O 流水线（注释：GEMM ordering guarantee）。写出这个保证的完整推理链，并指出它在哪一步断裂、由哪条流水线补救。`,
           hint: R`同一 MMA warp 发射的 UMMA 按序完成。`,
-          answer: R`推理链：corr_scale(i) 可读 ⇒ softmax 已 T2R 读完 S(i) ⇒ S(i) 的 QK GEMM 已完成 ⇒ 而同一 MMA warp 上 O(i-1) 的 PV GEMM 先于 S(i) 的 QK GEMM 发射且按序完成 ⇒ O(i-1) 必已写好。断裂点在尾声：最后一个 KV block 之后没有「下一个 S」来传递这个信号，row_sum 由 softmax 直接发布，此时 O(-1) 的 GEMM 可能还在跑——所以 correction 在 epilogue 必须显式 <code>pipeline_o_acc.consumer_wait</code>。`
+          answer: R`推理链：corr_scale(i) 可读 ⇒ softmax 已读完 S(i) ⇒ S(i) 的 QK GEMM 已完成 ⇒ 同一 MMA warp 上，上一轮 O 的 PV GEMM 发射更早且按序完成 ⇒ 上一轮 O 必已写好。最后一个 KV block 后没有“下一个 S”传递这个完成关系，因此最终 PV GEMM 可能仍在运行；correction 必须显式调用 <code>pipeline_o_acc.consumer_wait</code>。`
         },
         {
           kind: "推导", level: "进阶",
@@ -347,7 +347,7 @@
           kind: "设计", level: "挑战",
           q: R`如果把 correction 角色取消,把 rescale 合并进 softmax warp（算完 corr_scale 顺手改 O）,分析对寄存器账本和关键路径的双重影响。`,
           hint: R`O tile 是 128×128 fp32;softmax 的寄存器已经是全场最紧的。`,
-          answer: R`寄存器:rescale 需要把 O 分块 T2R 进寄存器,即便 16 列一批也要 16×fp32/线程的额外驻留,softmax 只能压缩 S 的驻留或降低 unroll,直接拖慢 exp2 吞吐。关键路径:rescale 会插在「读 S」与「写 P」之间,MMA 等待 P 的时间变长,pipeline_s_p_o 的空转增加;而独立 correction 让 rescale 与下一块的 softmax 完全并行。这正是 FFA 选择 4+4+4 三组分工而非 FA2 式单一角色的原因——SM100 的寄存器转移机制让「多养一组低配 warp」几乎免费。`
+          answer: R`寄存器方面，rescale 需要分批把 O 读入寄存器；即使每次只处理 16 列，也会挤占 softmax 保存 S 的空间。关键路径方面，rescale 会插在“读 S”和“写 P”之间，使 MMA 更晚拿到 P。独立 correction 则让 8 个 softmax warp 与 4 个 correction warp 并行，其余 4 个 warp 负责 load、MMA、epilogue 和调度。代价是增加一组轻量 warp，收益是缩短 softmax 关键路径。`
         }
       ],
       sources: [
@@ -392,7 +392,7 @@
         {
           title: "第一层：BlockInfo 跳块",
           body: [
-            R`先看右边界。一个 Q tile 覆盖 128 行；把其中最大的 Q 行号代入 causal 公式，就能得到该 tile 可能访问到的最大 K 列。再除以 128，便得到最后一个需要迭代的 K block。更右侧的 block 一定全无效，循环不会进入。滑动窗口的左边界用同样方法得到第一个 K block。`,
+            R`先看右边界。Q tile \(m_{\mathrm{block}}\) 覆盖 \(q\in[m_{\mathrm{block}}\cdot128,(m_{\mathrm{block}}+1)\cdot128)\)。源码使用开区间行上界 \(q_{\mathrm{end}}=(m_{\mathrm{block}}+1)\cdot128\)，由它得到 K 的开区间上界，再向上除以 128 得到 <code>n_block_max</code>；实际迭代满足 \(n_{\mathrm{block}}<\text{n\_block\_max}\)。更右侧的 K block 一定全无效。`,
             R`这里比较 mask 时使用<strong>切片内相对坐标</strong>，即 Q 和 K 都从各自切片的 0 开始。真正访问全局内存时才加上切片起点 offset。<code>SeqlenInfoQK</code> 同时保存长度和 offset，避免混用两套坐标。`,
             R`反向有对称的 <code>get_m_block_min_max</code>（固定 n_block 反推 Q 范围），第 7 章会用到。`
           ]
@@ -409,7 +409,7 @@
         {
           title: "第三层：行内列界与 R2P",
           body: [
-            R`进入 partial block 后，<code>row_idx</code> 是当前 Q 行在切片内的相对下标。代码把 \(s_k-s_q\) 和当前 K block 的起点合并成 <code>causal_row_offset</code>，于是 <code>col_limit_right</code> 直接给出该行在当前 block 内可保留到哪一列。滑动窗口还会得到左边界 <code>col_limit_left</code>。`,
+            R`进入 partial block 后，<code>row_idx</code> 是当前 Q 行在切片内的相对下标，<code>n_block</code> 是当前 K block 编号。把全局条件 \(k\le q+(s_k-s_q)\) 改写成块内列条件，可得 <code>local_col &lt; col_limit_right</code>。因此右界需要加 1：<code>col_limit_right = row_idx + causal_row_offset + 1</code>；<code>causal_row_offset</code> 已吸收 \(s_k-s_q\) 和 K block 起点。`,
             R`<code>r2p_bitmask_below</code> 生成“保留右边界左侧列”的 32 位掩码，<code>r2p_bitmask_above</code> 生成“保留左边界右侧列”的掩码。滑动窗口把两者按位 AND。编译期展开循环后，硬件可用一条 R2P 指令把 32 位映射到 32 个谓词。`
           ],
           formula: R`<p>指令量对比：设一个 128 列 tile 中，每行有 \(n_{\mathrm{func}}\) 个连续合法区间；普通 causal 时 \(n_{\mathrm{func}}=1\)。</p>
@@ -431,7 +431,7 @@
         {
           kind: "计算", level: "基础",
           q: R`\(s_q = s_k = 1024\)、tile 128×128、causal。对 m_block=3 的 Q tile，写出 n_block 迭代范围和三段循环各自覆盖的块。`,
-          hint: R`m_idx_max = 4×128 = 512。`,
+          hint: R`源码中的 <code>m_idx_max=4×128=512</code> 是开区间上界；最大合法 Q 行号是 511。`,
           answer: R`n_block_max = ⌈512/128⌉ = 4，即迭代 n_block 0..3。对角带起点：tile 内最小行 384 对应列界 385，所处块 = 3，故 Mainloop-1 覆盖 n_block 3（唯一 partial 块，含对角线），Mainloop-2 覆盖 n_block 0..2（full），Mainloop-3 不存在。方阵 causal 恰好每个 Q tile 只有 1 个 partial 块。`
         },
         {
@@ -542,7 +542,7 @@
           ]
         }
       ],
-      warning: R`<code>corr_scale</code> 只修正旧状态：它乘旧的 \(\ell\) 和 \(O\)，不乘当前 block。第一块没有旧状态，因此不需要发布该值。`,
+      warning: R`<code>corr_scale</code> 只修正旧状态，不乘当前 block：softmax 用它缩放旧 \(\ell\)，correction 用它缩放旧 \(O\)。第一块没有旧状态，因此不需要发布该值。`,
       exercises: [
         {
           kind: "推导", level: "基础",
@@ -647,11 +647,11 @@
         {
           title: "LSE：保留后续合并所需的归一化信息",
           body: [
-            R`LSE 公式为 \(\mathrm{LSE}=(mc+\log_2\ell-\text{max\_offset})\ln2\)。它还原为自然对数下的 \(\log\sum e^{s\cdot\text{scale}}\)；空行写 \(-\infty\)。`,
+            R`用 \(z_k\) 表示当前 Q 行对第 \(k\) 个 key 的 attention score。LSE 公式为 \(\mathrm{LSE}=(mc+\log_2\ell-\text{max\_offset})\ln2\)，它还原为自然对数下的 \(\log\sum_k e^{z_k\cdot\text{scale}}\)；空行写 \(-\infty\)。`,
             R`每个 rank 都输出一对 \((O,\mathrm{LSE})\)。分布式 GroupReduce 再用第 0 章的公式合并这些局部结果。kernel 内按 KV block 合并、kernel 外按 rank 合并，使用的是同一套数学结构。`
           ],
           formula: R`<p>验证 kernel 内与 kernel 间归约的一致性：kernel 尾声输出 \(O = \frac{\sum_k \tilde p_k v_k}{\ell}\)、\(\mathrm{LSE} = mc' + \ln \ell\)（\(c'=c\ln2\)）。两个 rank 合并时</p>
-\[ w_r = e^{\mathrm{LSE}_r - \mathrm{LSE}},\qquad O = \sum_r w_r O_r = \frac{\sum_r e^{\mathrm{LSE}_r} O_r}{e^{\mathrm{LSE}}} = \frac{\sum_r \sum_{k\in K_r} e^{s_k c'} v_k}{\sum_r \sum_{k \in K_r} e^{s_k c'}}, \]
+\[ w_r = e^{\mathrm{LSE}_r - \mathrm{LSE}},\qquad O = \sum_r w_r O_r = \frac{\sum_r e^{\mathrm{LSE}_r} O_r}{e^{\mathrm{LSE}}} = \frac{\sum_r \sum_{k\in K_r} e^{z_k c'} v_k}{\sum_r \sum_{k \in K_r} e^{z_k c'}}, \]
 <p>与把全部 K 交给单 kernel 的结果逐项相等。fp32 的 out 累加路径（functional 层 atomic 模式）走的正是分子分母同时累加的等价形式。</p>`
         }
       ],
@@ -742,7 +742,7 @@
         {
           title: "LPT 与 L2 swizzle 的坐标算术",
           body: [
-            R`先估算一个 head 的 K/V 占用：\(s_k(d+d_v)\times\)元素字节数。用约 50MB L2 预算除以它，得到可同时保留多少个 head，再向下取 2 的幂作为 <code>swizzle</code>。线性 tile 下标随后按这个组大小重排。`,
+            R`先估算一个 head 的 K/V 占用：\(s_k(d+d_v)\times\)元素字节数。源码用固定 50MB 作为 L2 可用预算；这是调度启发式常量，不是硬件精确容量。用它除以单 head 占用，再向下取 2 的幂作为 <code>swizzle</code>。`,
             R`LPT 的核心实现只是反转 block 编号：<code>block = num_block - 1 - block</code>。causal 中编号越大工作越重，所以重块最先派发。`,
             R`makespan 指所有任务完成所需的总时间。一般任务上，LPT 的最坏情况有经典近似界；对工作量近似线性增长的 causal tile，它通常更接近理想均衡。`
           ],
@@ -906,9 +906,9 @@
         },
         {
           kind: "系统", level: "进阶",
-          q: R`deterministic 模式的信号量把同一 m_block 的写者串行化。估算最坏情形的串行化代价，并解释 SPT（反转 lock 顺序）为什么能缓解它。`,
+          q: R`deterministic 模式的信号量把同一 m_block 的写者串行化。估算最坏情形的串行化代价，并解释“让 lock 顺序与 LPT 派发顺序同向”为何能缓解它。`,
           hint: R`causal 下 m_block 大的 Q tile 被多少个 n_block 写？调度器按什么顺序派 n_block？`,
-          answer: R`causal 下最后一个 m_block 被全部 \(n\) 个 n_block 写,若各写者同时到达,串行 TMA reduce 排队长 \(n\)。SPT 让 lock 顺序与 LPT 调度的派发顺序<strong>同向</strong>:先派发的 n_block(LPT 下是编号大的)恰好持有小 lock 值,先到先写;后派发的到达时前任大概率已完成——排队变成流水。顺序错配时(lock 升序、派发降序)最早到达的写者持最大 lock,要等所有后来者,退化为全串行。教训:确定性顺序必须与调度顺序协同设计。`
+          answer: R`causal 下最后一个 m_block 会被全部 \(n\) 个 n_block 写；若写者同时到达，最坏需要串行执行 \(n\) 次 TMA reduce。把 lock 顺序与 LPT 派发顺序设为同向后，先派发、通常也先到达的 n_block 持有较小 lock，可立即写入；后到达者再依次接续。若两种顺序相反，最早到达的写者反而要等待所有后来者，容易形成长队。`
         },
         {
           kind: "设计", level: "挑战",
@@ -1008,7 +1008,7 @@
           kind: "推导", level: "基础",
           q: R`设 host 计算 8ms,三个远端段的（通信,计算）分别为 (6,7)、(5,6)、(4,5) ms。分别计算 degree=3 流水线与「先拉全再算」两种方案的总时延。`,
           hint: R`套用 _calc_overall_cost 的公式。`,
-          answer: R`流水线：\(T = \max(6,8) + \max(5,7) + \max(4,6) + 5 = 8+7+6+5 = 26\) ms——三段通信全部藏进影子,总时延恰为纯计算 \(8+7+6+5=26\)。先拉全再算：通信 \(6+5+4=15\)（即使三路并发也受带宽约束按串行算）,再计算 \(8+7+6+5=26\),共 41ms。overlap 省下的正是全部 15ms 通信——前提是每段通信都不长于前一段计算。`
+          answer: R`流水线：\(T=\max(6,8)+\max(5,7)+\max(4,6)+5=26\) ms，等于纯计算时间。先拉全再算：在“各段共享同一通信带宽、通信时间相加”的教学假设下，通信为 \(6+5+4=15\) ms，再加 26ms 计算，共 41ms。此例中每段通信都短于前一段计算，因此可被完全隐藏。`
         },
         {
           kind: "源码", level: "进阶",
