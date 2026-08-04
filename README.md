@@ -62,7 +62,7 @@ node tools/validate.mjs
 - `chapter.html?id=<id>` — 统一章节渲染页
 - `assets/chapters.js` — 九章教学内容（takeaway/动机/解析/练习/来源）
 - `assets/code.js` — 交互源码块（真实行号 + GitHub 深链）
-- `assets/diagrams.js` — 9 张主架构图 + 8 张辅助示意图（JetBrains Mono、
+- `assets/diagrams.js` — 9 张主架构图 + 9 张辅助示意图（JetBrains Mono、
   KaTeX 公式、内置几何校验）
 - `assets/course.js` — 渲染器：目录、图-码联动工作台、进度
 - `assets/lineage.js` — 首页交互式优化点脉络图（依赖链高亮 + 解读卡片）

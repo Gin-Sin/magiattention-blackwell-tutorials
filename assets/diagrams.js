@@ -253,6 +253,33 @@
       edges.push({ d: edgeMatch[1], points: pathPoints(edgeMatch[1]) });
     }
 
+    function touchesNodeBoundary(point, node) {
+      var epsilon = 0.8;
+      var onVertical = (
+        Math.abs(point.x - node.x) <= epsilon ||
+        Math.abs(point.x - (node.x + node.w)) <= epsilon
+      ) && point.y >= node.y - epsilon && point.y <= node.y + node.h + epsilon;
+      var onHorizontal = (
+        Math.abs(point.y - node.y) <= epsilon ||
+        Math.abs(point.y - (node.y + node.h)) <= epsilon
+      ) && point.x >= node.x - epsilon && point.x <= node.x + node.w + epsilon;
+      return onVertical || onHorizontal;
+    }
+
+    edges.forEach(function (item) {
+      if (item.points.length < 2) {
+        throw new Error(diagramKey + ": connector has too few points: " + item.d);
+      }
+      var source = item.points[0];
+      var target = item.points[item.points.length - 1];
+      if (!boxes.some(function (node) { return touchesNodeBoundary(source, node); })) {
+        throw new Error(diagramKey + ": connector source is detached from nodes: " + item.d);
+      }
+      if (!boxes.some(function (node) { return touchesNodeBoundary(target, node); })) {
+        throw new Error(diagramKey + ": connector target is detached from nodes: " + item.d);
+      }
+    });
+
     edges.forEach(function (item) {
       for (var i = 1; i < item.points.length; i += 1) {
         for (var j = 0; j < boxes.length; j += 1) {
@@ -341,15 +368,17 @@
     b += box(180, 626, 590, 66, "cute.compile --enable-tvm-ffi", "编译一次 · 缓存 · 低开销启动", "gather", 9, "07");
     b += box(830, 626, 190, 66, "out, lse 返回", "供 GroupReduce 合并", "state", 10, "03");
 
-    b += edge(rootId, ortho(345, 152, 345, 236), null, "control");
-    b += edge(rootId, "M195 152V200H230V236", null, "compute");
-    b += edge(rootId, "M880 152V200H785V236", null, "control");
+    b += edge(rootId, "M530 152V194H345V236", null, "control");
+    b += edge(rootId, "M195 152V200H785V236", null, "compute");
+    b += edge(rootId, "M880 152V200H1040V348H740V366", null, "control");
     b += edge(rootId, ortho(345, 302, 345, 366), null, "gather");
     b += edge(rootId, "M785 302V334H475V366", null, "state");
     b += edge(rootId, ortho(345, 432, 345, 496), null, "compute");
+    b += edge(rootId, "M770 399H830", null, "state");
     b += edge(rootId, "M510 528H620", null, "cyan");
     b += edge(rootId, "M785 560V593H475V626", null, "compute");
-    b += edge(rootId, ortho(475, 692, 830, 692), null, "gather");
+    b += edge(rootId, "M770 659H830", null, "gather");
+    b += edge(rootId, "M1020 399H1040V659H1020", null, "state");
     return {
       svg: baseSvg(rootId, "attnslice", 730, b,
         "AttnSlice contract and host-side forward journey"),
@@ -373,8 +402,9 @@
     b += box(310, 84, 200, 64, "O (输出)", "TMA S2G 写回", "orange", null, "05");
 
     b += panel(40, 232, 500, 150, "SMEM · 224KB 预算", "compute");
-    b += box(70, 264, 200, 94, "sQ", "swizzled · q_stage 级", "compute", 2, "04");
-    b += box(310, 264, 200, 94, "sK / sV 复用", "kv_stage 环形缓冲", "compute", 3, "04");
+    b += box(70, 250, 200, 116, "sQ", "swizzled · q_stage 级", "compute", 2, "04");
+    b += box(310, 250, 200, 58, "sK / sV 复用", "kv_stage 环形缓冲", "compute", 3, "04");
+    b += box(310, 322, 200, 44, "sO · epilogue", "TMA S2G 前的写回槽", "compute", null, "05", { titleSize: 10.8, subSize: 8.0 });
 
     b += panel(600, 52, 460, 330, "TMEM · 128行 × 512列 fp32", "state");
     b += box(630, 96, 190, 60, "S0 | S1", "[0,128) | [128,256)", "state", 6, "02");
@@ -387,17 +417,18 @@
     b += box(90, 476, 400, 66, M("S = Q K^{\\mathsf T}", "S = Q K^T"), "tiled_mma_qk · A/B 来自 SMEM", "gather", 4, "03");
     b += box(590, 476, 400, 66, M("O \\mathrel{+}= P V", "O += P V"), "tiled_mma_pv · P 来自 TMEM", "gather", 5, "03");
 
-    b += edge(rootId, ortho(170, 148, 170, 264), [218, 190, "TMA G2S · tx_count", 168], "orange");
-    b += edge(rootId, "M240 148V200H410V264", null, "orange");
-    b += edge(rootId, "M170 358V420H240V476", null, "compute");
-    b += edge(rootId, "M340 358V476", null, "compute");
-    b += edge(rootId, "M410 358V430H620V476", [520, 416, "sV → PV GEMM", 130], "compute");
+    b += edge(rootId, ortho(170, 148, 170, 250), [218, 190, "TMA G2S · Q", 130], "orange");
+    b += edge(rootId, "M240 148V200H410V250", [350, 188, "TMA G2S · K/V", 130], "orange");
+    b += edge(rootId, "M170 366V420H240V476", null, "compute");
+    b += edge(rootId, "M310 279H290V420H340V476", null, "compute");
+    b += edge(rootId, "M510 279H590V430H620V476", [535, 416, "V · SMEM B operand", 140], "compute");
     b += edge(rootId, "M490 509H540V126H630", [560, 300, "写 S 累加器", 120], "state");
-    b += edge(rootId, "M660 256V476", [700, 400, "读 P (bf16)", 108], "gather");
-    b += edge(rootId, "M940 256V296", null, "state");
-    b += edge(rootId, "M940 156V196", null, "state");
-    b += edge(rootId, "M990 476V420H1044V126H1030", null, "state");
-    b += edge(rootId, "M900 96V40H410V84", [660, 28, "correction → sO → TMA S2G 写回", 250], "orange");
+    b += edge(rootId, "M660 256V476", [710, 400, "P · TMEM A operand", 140], "gather");
+    b += edge(rootId, "M725 156V196", null, "state");
+    b += edge(rootId, "M820 126H835V226H850", null, "state");
+    b += edge(rootId, "M990 509H1044V126H1030", [1015, 300, "写 O 累加器", 112, 8.2], "state");
+    b += edge(rootId, "M940 156V180H1070V400H410V366", [900, 388, "correction epilogue → sO", 190], "state");
+    b += edge(rootId, "M510 344H570V180H410V148", [490, 168, "TMA S2G · O", 120], "orange");
     return {
       svg: baseSvg(rootId, "blackwell", 600, b,
         "Blackwell execution substrate: TMA, SMEM, TMEM and tcgen05 UMMA"),
@@ -435,14 +466,15 @@
 
     b += edge(rootId, "M310 124H470", [382, 110, "producer", 76, 8.2], "compute");
     b += edge(rootId, "M310 224H470", [382, 210, "S-full", 76, 8.2], "compute");
-    b += edge(rootId, "M310 350H470", [382, 336, "P release", 76, 8.2], "compute");
-    b += edge(rootId, "M310 480H470", [382, 466, "scale / O", 76, 8.2], "compute");
+    b += edge(rootId, "M310 338H390V238H470", [390, 286, "P release", 86, 8.2], "compute");
+    b += edge(rootId, "M310 362H470", [382, 348, "写 corr_scale", 104, 8.2], "compute");
+    b += edge(rootId, "M470 368H410V480H310", [408, 418, "读 scale", 76, 8.2], "state");
+    b += edge(rootId, "M310 468H370V244H470", [370, 292, "O release", 80, 8.2], "state");
+    b += edge(rootId, "M310 492H470", [382, 478, "O / sO", 76, 8.2], "compute");
     b += edge(rootId, "M720 224H780", null, "gather");
-    b += edge(rootId, "M595 256V312", null, "gather");
-    b += edge(rootId, "M720 350H765V478H780", null, "state");
+    b += edge(rootId, "M310 504H400V550H900V518", null, "state");
     b += edge(rootId, "M780 366H735V480H720", null, "state");
     b += edge(rootId, "M190 518V582", null, "compute");
-    b += edge(rootId, "M595 518V582", null, "gather");
     return {
       svg: baseSvg(rootId, "pipeline", 700, b,
         "Warp specialization roles and mbarrier pipelines"),
@@ -467,6 +499,7 @@
     b += panel(40, 176, 1020, 128, "第一层 · BlockInfo 跳块(免费)", "control");
     b += box(90, 210, 400, 66, "get_n_block_min_max", "整块非法的 n_block 不迭代", "control", 2, "01");
     b += box(560, 210, 440, 66, "get_n_block_min_causal_local_mask", "定位 partial 带的边界", "control", 3, "01");
+    b += box(410, 318, 280, 38, "n_block 分段结果", "partial-right | full | partial-left", "cyan", null, null, { titleSize: 10.5, subSize: 7.8 });
 
     b += panel(40, 356, 1020, 128, "第二层 · 三段主循环(近免费)", "compute");
     b += box(90, 390, 280, 66, "Mainloop-1 · partial", "带 mask_fn · 从右往左", "orange", 4, "02");
@@ -476,16 +509,19 @@
     b += panel(40, 536, 1020, 128, "第三层 · 元素级写 -inf(边界块专属)", "state");
     b += box(90, 570, 280, 66, "apply_mask_sm100", "col_limit 由行号线性给出", "state", 6, "03");
     b += box(410, 570, 280, 66, "R2P 位掩码", "32 列一条 uint32", "state", 7, "05");
-    b += box(730, 570, 280, 66, "mask_mod / 双界", "可编程谓词 · below&above", "state", 8, "06");
+    b += box(730, 570, 280, 66, "mask_mod · block-sparse", "任意谓词 · 独立慢路径", "state", 8, "06");
 
     b += edge(rootId, ortho(285, 124, 285, 210), null, "compute");
+    b += edge(rootId, "M500 92H530V190H650V210", null, "compute");
     b += edge(rootId, "M810 124V162H780V210", null, "cyan");
-    b += edge(rootId, ortho(290, 276, 230, 390), "", "control");
-    b += edge(rootId, "M780 276V330H550V390", null, "control");
+    b += edge(rootId, "M290 276V298H480V318", null, "control");
+    b += edge(rootId, "M780 276V298H620V318", null, "control");
+    b += edge(rootId, "M470 356V372H230V390", null, "cyan");
+    b += edge(rootId, "M550 356V390", null, "cyan");
+    b += edge(rootId, "M630 356V372H870V390", null, "cyan");
     b += edge(rootId, ortho(230, 456, 230, 570), null, "orange");
-    b += edge(rootId, "M370 603H410", null, "state");
-    b += edge(rootId, "M690 603H730", null, "state");
-    b += edge(rootId, "M870 456V570", [960, 500, "仅 partial 块付钱", 150], "orange");
+    b += edge(rootId, "M370 603H410", [390, 589, "uses", 52, 8.2], "state");
+    b += edge(rootId, "M870 456V510H550V570", [700, 498, "local 双界", 100, 8.2], "orange");
     return {
       svg: baseSvg(rootId, "mask", 700, b,
         "Three-layer masking: block skipping, segmented loop, element predicates"),
@@ -527,6 +563,7 @@
     b += edge(rootId, ortho(620, 248, 620, 292), null, "gather");
     b += edge(rootId, ortho(620, 364, 620, 428), null, "gather");
     b += edge(rootId, "M870 130H820V212H770", null, "orange");
+    b += edge(rootId, "M870 254H820V400H370V364", [600, 388, "rescale_threshold", 132, 8.2], "orange");
     b += edge(rootId, "M870 378H795V248H770", null, "orange");
     return {
       svg: baseSvg(rootId, "softmax", 560, b,
@@ -564,9 +601,10 @@
     b += edge(rootId, "M630 120V168H815V216", [732, 148, "尾声槽", 90], "state");
     b += edge(rootId, ortho(285, 280, 285, 320), null, "compute");
     b += edge(rootId, ortho(285, 384, 285, 424), null, "control");
+    b += edge(rootId, ortho(285, 488, 285, 494), null, "gather");
     b += edge(rootId, ortho(815, 280, 815, 320), null, "orange");
     b += edge(rootId, ortho(815, 384, 815, 424), null, "compute");
-    b += edge(rootId, ortho(815, 488, 815, 494), null, "gather");
+    b += edge(rootId, "M1020 248H1040V526H1020", [1000, 402, "row stats", 82, 8.2], "cyan");
     return {
       svg: baseSvg(rootId, "correction", 620, b,
         "Correction main loop and epilogue"),
@@ -644,8 +682,8 @@
     b += box(70, 650, 440, 66, "postprocess", M("dQ=\\mathrm{cast}(dQ_{acc}\\times c)", "dQ cast+scale"), "control", 7, "07");
     b += box(590, 650, 430, 66, "dK/dV 就地写出", "TMEM 累加完 · epilogue ×scale", "gather", null, "04");
 
+    b += edge(rootId, "M510 89H590", null, "control");
     b += edge(rootId, ortho(290, 122, 290, 218), [352, 160, "D / LSE 流入", 118], "control");
-    b += edge(rootId, "M805 122V170H890V218", null, "state");
     b += edge(rootId, ortho(230, 288, 230, 340), null, "compute");
     b += edge(rootId, ortho(570, 288, 570, 340), null, "state");
     b += edge(rootId, ortho(890, 288, 890, 340), null, "compute");
@@ -653,7 +691,7 @@
     b += edge(rootId, ortho(300, 410, 300, 470), null, "gather");
     b += edge(rootId, "M520 510H580", null, "orange");
     b += edge(rootId, ortho(290, 550, 290, 650), null, "state");
-    b += edge(rootId, "M700 410V430H1044V683H1020", [880, 620, "dK/dV epilogue", 140], "gather");
+    b += edge(rootId, "M700 410V430H1044V620H805V650", [950, 608, "dK/dV epilogue", 140], "gather");
     return {
       svg: baseSvg(rootId, "backward", 740, b,
         "Backward pass: preprocess, K-centric 5-GEMM kernel, dQ atomic reduce, postprocess"),
@@ -701,8 +739,7 @@
     b += edge(rootId, "M330 381H305V320H330", [258, 348, "下一拍", 66, 8.2], "compute", true);
     b += edge(rootId, "M455 334V356", null, "compute");
     b += edge(rootId, "M430 406V440H195V508", [320, 428, "发起 GroupCast", 130], "gather");
-    b += edge(rootId, "M1000 334V452H250V508", [700, 440, "bwd dKV / qo_comm 走网络", 210], "state");
-    b += edge(rootId, "M820 320H840V466H890V508", [852, 490, "少开 CTA", 80, 8.2], "orange");
+    b += edge(rootId, "M890 508V464H840V320H820", [852, 446, "少开 CTA", 80, 8.2], "orange");
     return {
       svg: baseSvg(rootId, "overlap", 660, b,
         "Communication-computation overlap: solver, pipeline loop, comm primitives and SM budget"),
@@ -1013,6 +1050,51 @@
     };
   }
 
+  function auxCpCommunication(rootId) {
+    var b = "";
+
+    b += panel(40, 52, 1020, 140, "均匀输入分片示例 · CP=4 · packed tensor（实际 stage 以 CommMeta 为准）", "control");
+    b += box(50, 88, 230, 76, "Rank 0", "Q₀ [1024,16,128] · K₀/V₀ [1024,4,128]", "compute", null, null, { subSize: 8.2 });
+    b += box(305, 88, 230, 76, "Rank 1", "Q₁ [1024,16,128] · K₁/V₁ [1024,4,128]", "compute", null, null, { subSize: 8.2 });
+    b += box(560, 88, 230, 76, "Rank 2", "Q₂ [1024,16,128] · K₂/V₂ [1024,4,128]", "compute", null, null, { subSize: 8.2 });
+    b += box(815, 88, 230, 76, "Rank 3", "Q₃ [1024,16,128] · K₃/V₃ [1024,4,128]", "compute", null, null, { subSize: 8.2 });
+
+    b += panel(40, 232, 1020, 150, "默认 KV-COMM · 前向", "gather");
+    b += box(60, 270, 215, 72, "Rank 2 · KV 属主", "chunk c: K/V [256,4,128]", "control", null, null);
+    b += box(325, 270, 210, 72, "GroupCast(c)", "dst=[0,3] · 每个目标 512 KiB", "gather", null, null);
+    b += box(585, 270, 220, 72, "Rank 0 / Rank 3", "各收到一份 K/V chunk c", "compute", null, null);
+    b += box(855, 270, 185, 72, "FFA + 本地合并", "out_acc/lse_acc · 不上网", "state", null, null, { subSize: 8.2 });
+    b += edge(rootId, "M275 306H325", null, "control");
+    b += edge(rootId, "M535 306H585", null, "gather");
+    b += edge(rootId, "M805 306H855", null, "compute");
+
+    b += panel(40, 432, 1020, 150, "默认 KV-COMM · 反向", "state");
+    b += box(60, 470, 215, 72, "Rank 0 / Rank 3", "各自产生 partial dK_c / dV_c", "compute", null, null, { subSize: 8.3 });
+    b += box(325, 470, 210, 72, "GroupReduce(sum)", "src=[0,3] · fp32 累加可选", "gather", null, null);
+    b += box(585, 470, 220, 72, "Rank 2 · KV 属主", "得到完整 dK_c / dV_c", "control", null, null);
+    b += box(855, 470, 185, 72, "dQ 留在 Q 属主", "本地累加 · 不走网络", "control", null, null, { dashed: true, subSize: 8.2 });
+    b += edge(rootId, "M275 506H325", null, "compute");
+    b += edge(rootId, "M535 506H585", null, "gather");
+
+    b += panel(40, 632, 1020, 150, "QO-COMM · 可选的前向对偶路径", "orange");
+    b += box(60, 670, 190, 72, "Q 属主", "Q chunk [256,16,128]", "compute", null, null);
+    b += box(300, 670, 210, 72, "GroupCast(Q)", "把 Q 发到需要计算的 KV rank", "gather", null, null, { subSize: 8.2 });
+    b += box(560, 670, 220, 72, "KV 属主 · FFA", "本地 KV × 远端 Q", "compute", null, null);
+    b += box(830, 670, 210, 72, "GroupReduce(lse)", "out/LSE 加权合并回 Q 属主", "state", null, null, { subSize: 8.2 });
+    b += edge(rootId, "M250 706H300", null, "compute");
+    b += edge(rootId, "M510 706H560", null, "gather");
+    b += edge(rootId, "M780 706H830", null, "compute");
+
+    b += textLabel(550, 810,
+      "紫色 = MagiAttention GroupCast / GroupReduce；蓝色 = FFA 计算；绿色 = 数据属主/本地状态；玫瑰 = partial 结果。",
+      10.2, P.muted, 500);
+    return {
+      svg: baseSvg(rootId, "cp-communication", 840, b,
+        "Context-parallel tensor flow through GroupCast and GroupReduce"),
+      caption: "CP=4 的 tensor 流向：默认 KV-comm 在前向多播 K/V、在反向归约 dK/dV；qo_comm 则多播 Q，并把 partial out/LSE 按 LSE 规则归约回 Q 属主。"
+    };
+  }
+
   /* ---------------- registry ---------------- */
 
   var mains = {
@@ -1035,7 +1117,8 @@
     "correction-handshake": auxCorrectionHandshake,
     "lpt-swizzle": auxLptSwizzle,
     "bwd-tmem": auxBwdTmem,
-    "overlap-timeline": auxOverlapTimeline
+    "overlap-timeline": auxOverlapTimeline,
+    "cp-communication": auxCpCommunication
   };
 
   var buildSerial = 0;

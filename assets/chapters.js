@@ -957,6 +957,25 @@
       },
       explain: [
         {
+          title: "CP 通信全过程：tensor 从哪里来、到哪里去",
+          body: [
+            R`用一个具体配置贯穿本节：\(B=1,\ S=4096,\ CP=4,\ H_q=16,\ H_{kv}=4,\ D_q=D_k=D_v=128\)，Q/K/V 为 bf16。为便于计算尺寸，先假设输入按 token 维均匀分片、<code>flatten_head_groups</code> 关闭且使用 FFA backend，于是每个 rank 初始持有 1024 个 token。分布式层采用 packed 布局，因此省略 batch 维，写成 <code>[num_tokens, num_heads, head_dim]</code>。GQA 比例为 \(H_q/H_{kv}=4\)：4 个 Q head 共用 1 个 KV head。实际每个 stage 的 \(T_q,T_{kv}\) 由 mask、dispatch 与 <code>CommMeta.num_remote_*_tokens_per_stage</code> 决定，不一定等于 1024。`,
+            R`为展示“一段发多家”，刻意构造一个不规则依赖：rank 2 的 256-token KV 分片 \(c\) 同时被 rank 0 和 rank 3 的 Q 需要，但 rank 1 不需要；这不是标准连续 causal 的固定通信表。AttnSlice/dispatch 会生成通信元数据：发送侧 <code>dst_indices[c]=[0,3]</code>，两个接收段的 <code>src_index</code> 都是 2。<code>GroupCast</code> 据此各发送一份 \(K_c,V_c\)。对称 K/V 可沿 token 维打包成 <code>[2×256,4,128]</code>；<code>CommMeta</code> 把 <code>packed_times=2</code> 计入 split sizes，因此每个目标实际接收 512 KiB。`,
+            R`在默认 <strong>KV-comm</strong> 模式中，Q 不移动。rank 0 用本地 \(Q_0\in[1024,16,128]\) 与收到的 \(K_c,V_c\in[256,4,128]\) 计算一份 partial attention。逻辑输出形状为 <code>out_c=[1024,16,128]</code>、<code>lse_c=[1024,16]</code>；具体 backend 可能在接口边界转置 LSE。使用 FFA backend 时，不同 KV stage 的结果通过 <code>out_acc/lse_acc</code> 在本 rank 合并，前向默认不为 out/LSE 发起网络 GroupReduce。`,
+            R`反向是前向的镜像：rank 0 和 rank 3 各自得到 \(dK_c,dV_c\in[256,4,128]\)。此时发送侧 <code>dst_index[c]=2</code>，rank 2 的接收元数据为 <code>src_indices[c]=[0,3]</code>；<code>GroupReduce(reduce_op="sum")</code> 把两份梯度相加回 KV 属主，\(dQ\) 则留在 Q 属主本地累加。`,
+            R`可选、依赖 solver 配置的 <strong>qo_comm</strong> 路径会交换角色。前向由 <code>GroupCast</code> 把 Q 分片送到计算所在的 KV rank，再用 <code>GroupReduce(reduce_op="lse")</code> 把 partial out/LSE 合并回 Q 属主。反向还会 GroupCast Q/O/dO/LSE，并分别用 <code>GroupReduce(sum)</code> 把 dQ、dKV 送回各自属主。实现使用独立的 <code>cp_group_gc</code> 与 <code>cp_group_gr</code>，使 cast 与 reduce 可以重叠。`
+          ],
+          svg: "cp-communication",
+          formula: R`<p>本例中每个 rank 的本地 tensor 大小（bf16）为：</p>
+\[ Q_r:[1024,16,128]=4\,\mathrm{MiB},\qquad K_r,V_r:[1024,4,128]=1\,\mathrm{MiB}\ \text{each}. \]
+<p>一个 256-token KV 分片发往<strong>一个</strong>目标 rank 时：</p>
+\[ K_c,V_c:[256,4,128]=256\,\mathrm{KiB}\ \text{each},\qquad K_c{+}V_c=512\,\mathrm{KiB}. \]
+<p>该分片若覆盖 rank 0 的全部本地 Q，则 partial 结果的逻辑大小为：</p>
+\[ out_c:[1024,16,128]_{\mathrm{fp32}}=8\,\mathrm{MiB},\qquad LSE_c:[1024,16]_{\mathrm{fp32}}=64\,\mathrm{KiB}. \]
+<p>若改走 qo_comm，一个 256-token Q 分片为 \([256,16,128]_{\mathrm{bf16}}=1\,\mathrm{MiB}\)；对应的 fp32 partial out/LSE 原始大小为 2 MiB + 16 KiB，随后需要回到 Q 属主。</p>
+<p>这说明默认 KV-comm 为何重要：本例每目标只传 512 KiB KV，8 MiB 的 fp32 partial out 留在本地合并。实际线上字节数还受目标 rank 数、<code>comm_dtype</code>、高精度归约开关、有效 Q 行数和分片复用方式影响。</p>`
+        },
+        {
           title: "GroupCast / GroupReduce：为不规则依赖定制的集合通信",
           body: [
             R`<strong>group_cast</strong> 先按 <code>input_split_sizes</code> 切段，再用 <code>dst_indices[i]</code> 指定每段要发给哪些 rank。<strong>group_reduce</strong> 做反向操作：把多个来源的对应段送回属主，并按 sum、avg 或注意力专用的 <code>"lse"</code> 规则合并。`,
