@@ -1023,11 +1023,11 @@
 <p>每个 \(\max\) 表示同一拍中的通信和计算并行，较慢的一项决定该拍时长。该公式是理想模型：它没有显式计入队列阻塞、固定发射开销和资源竞争，这些因素需要实测校准。</p>`
         },
         {
-          title: "每一拍谁收谁发：同一清单的两种切法",
+          title: "overlap_degree 与每一拍：把远端接收列切成几段",
           body: [
-            R`<code>overlap_degree</code> 决定全部远端通信被拆成几轮 <code>group_cast</code>，每个 stage 都对应一轮集合通信和一次 FFA 计算。真正被切分的是<strong>每个 rank 要接收的远端 KV</strong>，也就是从接收方看通信矩阵中属于该 rank 的一列，目的是让收取节奏与本 rank 的计算流水对齐。各接收方的 stage 划分投影回发送侧后，才决定发送方每一拍发什么、发给谁，并写入 <code>CommMeta</code> 的逐 stage 清单。`,
-            R`同一份依赖清单可以有多种合法切法，图中 \(CP=4\)、<code>overlap_degree=3</code> 的两种方案总字节数相同，区别只在流水粒度和每拍负载。方案 A 的每拍收取表恰为一个置换，每个 rank 单发单收；KV₀ 依次直达 rank 3、2、1，时间线近似 Ring Attention 的轮转，却不沿环接力。方案 B 则把同一属主的目标集中到一拍：KV₀ 在拍 0 以 <code>dst=[1,2,3]</code> 一次多播；NCCL a2av 路径要按目标打包多份拷贝，发送负载因而偏斜。<code>OverlapSolver</code> 会让每拍的 \(\max(\mathrm{通信},\mathrm{计算})\) 尽量小且均匀，当前默认均匀划分通常更接近方案 A。`,
-            R`逐拍收取还能复用接收缓冲：稳态约只需“正在计算的一块 + 在途的一块”双缓冲；若一次预取全部 stage，full mask 下峰值会升到 \(CP-1\) 块。这与前文“degree 越大，缓冲需求越高”的 warning 一致，也解释了 native grpcoll 复用同一缓冲区时为何只能逐 stage 预取。至于两个端点：<code>degree=0</code> 阻塞式拉全量、完全不重叠，<code>degree=1</code> 把全部远端 KV 放在一段，只能借 host 本地计算掩护。`
+            R`<code>overlap_degree</code> 的本义，是把<strong>每个 rank 要接收的远端 KV</strong>按 chunk 粒度切成多少段；chunk 是按 <code>chunk_size</code> 个 token 划分的连续段。切分采用接收方视角，也就是切开通信矩阵中属于本 rank 的远端接收列；每个 stage 对应一轮 <code>group_cast</code> 集合通信和一次 FFA 计算。各接收方的划分投影回发送侧后，才决定发送方每一拍发什么、发给谁，并记录在 <code>CommMeta</code> 的逐 stage 清单中。`,
+            R`图中的 full mask 取 \(CP=4\)、<code>overlap_degree=3</code>：每个 rank 的 6 个远端 chunk 被均分成 3 拍，每拍接收 2 个 chunk，错峰置换使每拍每个 rank 单发单收。第 \(i\) 拍先用一轮 <code>group_cast</code> 收取 stage \(i\) 并预取 stage \(i+1\)，随后 FFA 让本地 Q 完整遍历本拍的 KV 子集，得到 partial <code>(out, lse)</code>。这些局部结果经 <code>out_acc/lse_acc</code> 按合并公式跨拍累积，正对应 FlashAttention 在 kernel 内用 \(m/\ell/O\) 递推的分布式重现。整个前向中，每个远端 KV chunk 恰好传输并遍历一次，而本地 Q 会被重读 <code>degree+1</code> 次：一次 host 拍，加上每个远端拍各一次。`,
+            R`取值上，源码默认 <code>degree=1</code>，即本地一段加远端整体一段；<code>degree=0</code> 是内部归一化的阻塞式无重叠模式，<code>degree=N≥2</code> 表示静态多段，<code>degree=None</code> 则由 solver 在 <code>dynamic_max_degree</code> 上限内动态搜索。切分受 <code>min_chunk_size=512</code> 与 <code>max_num_chunks=64</code> 约束；默认 uniform 算法按块数均分并把余数摊给前几拍，另有 greedy 算法备选，而源码也明确将 uniform 称为可行但非生产级的占位方案。按块数均分能均匀每拍通信量，但各 chunk 的计算量由 mask 面积决定，所以每拍的 \(\max(\mathrm{通信},\mathrm{计算})\) 未必均匀；<code>degree</code> 与 \(CP-1\) 没有绑定，图中取 3 只是为了对齐属主边界。每多一拍会增加一次 kernel/通信发射和一轮 a2av 固定延迟；接收缓冲峰值则由预取策略决定：逐段预取的双缓冲约为 \(2\times(\mathrm{全部远端\ KV}/\mathrm{degree})\)，一次性预取全部 stage 时等于全部远端 KV、与 <code>degree</code> 无关。`
           ],
           svg: "overlap-degree-schedule"
         },
@@ -1040,7 +1040,7 @@
           ]
         }
       ],
-      warning: R`<code>overlap_degree</code> 不是越大越好。每多一段都会增加一次发射、固定通信延迟和缓冲需求。还要区分模式：默认 KV-comm 的前向 out/LSE 在本地合并；反向 dKV 和 qo_comm 才使用网络 GroupReduce。`,
+      warning: R`<code>overlap_degree</code> 不是越大越好。每多一段都会增加一次 kernel/通信发射和一轮 a2av 固定延迟；接收缓冲峰值取决于预取深度，而不是由 degree 单独决定。还要区分模式：默认 KV-comm 的前向 out/LSE 在本地合并；反向 dKV 和 qo_comm 才使用网络 GroupReduce。`,
       exercises: [
         {
           kind: "概念", level: "基础",

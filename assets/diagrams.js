@@ -1151,57 +1151,80 @@
 
   function auxOverlapDegreeSchedule(rootId) {
     var b = "";
-    var cellW = 90;
-    var cellH = 48;
+    /* chunk owner tones: rank0 = orange (traced), rank1/2/3 distinct */
+    var ownerTone = ["orange", "compute", "state", "control"];
 
-    function scheduleGrid(x0, y0, recvTable) {
-      var out = "";
-      for (var c = 0; c < 4; c += 1) {
-        out += textLabel(x0 + c * cellW + cellW / 2, y0 - 16, "rank " + c, 9, P.ink, 600);
-      }
-      for (var r = 0; r < 3; r += 1) {
-        out += textLabel(x0 - 44, y0 + r * cellH + cellH / 2, "拍 " + r, 9.5, P.ink, 600);
-        for (var c2 = 0; c2 < 4; c2 += 1) {
-          var kv = recvTable[r][c2];
-          var hot = kv === 0;
-          var x = x0 + c2 * cellW;
-          var y = y0 + r * cellH;
-          out += '<rect x="' + x + '" y="' + y + '" width="' + (cellW - 6) + '" height="' + (cellH - 6) +
-            '" rx="7" fill="' + toneFill(hot ? "orange" : "gather") +
-            '" stroke="' + toneStroke(hot ? "orange" : "gather") + '" stroke-width="1.1"/>' +
-            textLabel(x + cellW / 2 - 3, y + cellH / 2 - 3, "收 KV" + kv, 9.4, P.ink, hot ? 700 : 500);
-        }
-      }
-      return out;
+    function chunkBox(x, y, w, h, label, owner) {
+      return '<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h +
+        '" rx="7" fill="' + toneFill(ownerTone[owner]) +
+        '" stroke="' + toneStroke(ownerTone[owner]) + '" stroke-width="1.1"/>' +
+        textLabel(x + w / 2, y + h / 2, label, 9.4, P.ink, owner === 0 ? 700 : 500);
     }
 
-    b += textLabel(550, 34, "Full mask · CP=4 · overlap_degree=3：每拍一轮 group_cast；单元格 = 该 rank 本拍收到的 KV 段（橙 = KV₀ 的去向）", 10.3, P.muted, 500);
+    /* ---- Panel 1: per-beat receive schedule ---- */
+    b += panel(40, 52, 1020, 352, "每一拍谁收什么 · full mask · CP=4 · overlap_degree=3", "control");
+    b += textLabel(550, 96,
+      "每个 rank 本地持有 2 个 chunk：rank 0 = c₀ c₁ ｜ rank 1 = c₂ c₃ ｜ rank 2 = c₄ c₅ ｜ rank 3 = c₆ c₇；", 9.8, P.muted, 500);
+    b += textLabel(550, 118,
+      "对任一 rank，远端共 6 个 chunk，默认按块数均分为 3 拍 × 2 chunk（颜色 = chunk 属主，橙 = rank 0 的 c₀ c₁）。", 9.8, P.muted, 500);
 
-    b += panel(40, 64, 500, 344, "方案 A · 错峰置换（均匀划分）", "control");
-    b += scheduleGrid(160, 150, [
+    var cellW = 150;
+    var cellH = 54;
+    var gx0 = 260;
+    var gy0 = 176;
+    /* recvOwner[beat][receiver] = owner rank whose 2 chunks arrive (staggered permutation) */
+    var recvOwner = [
       [1, 2, 3, 0],
       [2, 3, 0, 1],
       [3, 0, 1, 2]
-    ]);
-    b += textLabel(290, 330, "每拍恰为一个置换：每个 rank 单发单收，逐拍负载均匀；", 9.6, P.muted, 500);
-    b += textLabel(290, 352, "KV₀ 依次直达 rank 3→2→1——形似环形轮转，但一步到位、不经接力。", 9.6, P.muted, 500);
+    ];
+    for (var t = 0; t < 4; t += 1) {
+      b += textLabel(gx0 + t * cellW + (cellW - 12) / 2, gy0 - 16, "rank " + t + " 收", 9.2, P.ink, 600);
+    }
+    for (var r = 0; r < 3; r += 1) {
+      b += textLabel(gx0 - 56, gy0 + r * cellH + (cellH - 10) / 2, "拍 " + r, 9.8, P.ink, 600);
+      for (var c = 0; c < 4; c += 1) {
+        var owner = recvOwner[r][c];
+        b += chunkBox(gx0 + c * cellW, gy0 + r * cellH, cellW - 12, cellH - 10,
+          "c" + (2 * owner) + " c" + (2 * owner + 1), owner);
+      }
+    }
+    b += textLabel(550, 356, "拍 i = 一轮 group_cast（收 stage i 的 2 个 chunk，同时预取 stage i+1）+ 一次 FFA（本地 Q 完整遍历本拍 chunk）；", 9.7, P.muted, 500);
+    b += textLabel(550, 380, "partial (out, lse) 经 out_acc/lse_acc 跨拍累积：KV 全程只被遍历一次，Q 每拍重读一次。", 9.7, P.muted, 500);
 
-    b += panel(560, 64, 500, 344, "方案 B · 属主同拍多播（按属主排序）", "orange");
-    b += scheduleGrid(680, 150, [
-      [1, 0, 0, 0],
-      [2, 2, 1, 1],
-      [3, 3, 3, 2]
-    ]);
-    b += textLabel(810, 330, "同一属主的目标集中到同一拍：拍 0 中 KV₀ 以 dst=[1,2,3] 一次多播；", 9.6, P.muted, 500);
-    b += textLabel(810, 352, "每拍总量仍是 4 段，但单 rank 发送负载偏斜（rank 0 在拍 0 独发 3 份）。", 9.6, P.muted, 500);
+    /* ---- Panel 2: degree = how many slices of the receive column ---- */
+    b += panel(40, 434, 1020, 232, "overlap_degree = 把「要接收的远端 KV 列」切成几段（rank 0 视角）", "gather");
 
-    b += textLabel(550, 446,
-      "两种划分的总字节数相同（= 通信矩阵的着色格数）；OverlapSolver 按「每拍 max(通信, 计算) 尽量小且均匀」选择，默认均匀划分接近方案 A。",
-      10.2, P.muted, 500);
+    function chunkStrip(y, groups, degLabel, beatLabelY) {
+      var out = "";
+      out += textLabel(140, y + 20, degLabel, 10, P.ink, 700);
+      var chunks = [
+        ["c₂", 1], ["c₃", 1], ["c₄", 2], ["c₅", 2], ["c₆", 3], ["c₇", 3]
+      ];
+      chunks.forEach(function (chunk, i) {
+        out += chunkBox(230 + i * 100, y, 88, 40, chunk[0], chunk[1]);
+      });
+      groups.forEach(function (group, gi) {
+        var x1 = 230 + group[0] * 100 - 6;
+        var x2 = 230 + group[1] * 100 + 88 + 6;
+        out += '<rect x="' + x1 + '" y="' + (y - 7) + '" width="' + (x2 - x1) +
+          '" height="54" rx="10" fill="none" stroke="' + P.gatherStroke +
+          '" stroke-width="1.3" stroke-dasharray="6 5"/>';
+        out += textLabel((x1 + x2) / 2, beatLabelY, "拍 " + gi, 9, P.gatherStroke, 600);
+      });
+      return out;
+    }
+
+    b += chunkStrip(492, [[0, 1], [2, 3], [4, 5]], "degree=3", 476);
+    b += chunkStrip(578, [[0, 2], [3, 5]], "degree=2", 562);
+
+    b += textLabel(550, 646,
+      "同一列可切成不同段数：uniform 算法按块数均分（6/3=2、6/2=3）。degree 与 CP−1 无绑定：源码默认 degree=1（远端整体一段），或 None 交给 solver 搜索。",
+      9.9, P.muted, 500);
     return {
-      svg: baseSvg(rootId, "overlap-degree-schedule", 478, b,
-        "Two per-stage send/receive schedules under overlap_degree=3 for a full mask"),
-      caption: "overlap_degree=3 把 full mask 的远端通信拆成 3 拍，但「每拍谁发给谁」由各接收方的 stage 划分反推：方案 A 逐拍错峰、单发单收；方案 B 让同一 KV 段在一拍内完成全部多播。总字节数不变，变的是流水粒度与每拍的负载形态。"
+      svg: baseSvg(rootId, "overlap-degree-schedule", 680, b,
+        "Per-beat receive schedule and receive-column partitions under different overlap degrees"),
+      caption: "上：full mask、CP=4、chunk 粒度下 overlap_degree=3 的每拍收取表——每拍一轮 group_cast 收 2 个 chunk，FFA 用本地 Q 完整遍历本拍子集，橙色追踪 rank 0 两个 chunk 的去向。下：overlap_degree 的本义是把接收方的远端 KV 列切成几段（rank 0 视角），同一列既可切 3 段也可切 2 段——degree 与 CP−1 没有绑定关系。"
     };
   }
 
