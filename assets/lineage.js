@@ -11,115 +11,82 @@
   var NODES = [
     /* L0 · 契约层 */
     {
-      id: "rep", x: 140, y: 46, w: 250, tone: "compute", no: "00",
-      title: "AttnSlice 切片表示", sub: "任意 mask → 矩形切片 × 4 种几何",
+      id: "attnslice", x: 420, y: 46, w: 260, tone: "compute", no: "00",
+      title: "AttnSlice 契约", sub: "切片语义 · 可合并输出",
       chapter: "attnslice",
-      detail: "把 mask 从「形状」变成「清单」：任意注意力模式分解为 (QRange, KRange, MaskType) 三元组的集合。切片内部只有 FULL/CAUSAL/INV-CAUSAL/BI-CAUSAL 四种几何——kernel 不再枚举 mask 分支，分布式不再盲目全交换。"
-    },
-    {
-      id: "semi", x: 660, y: 46, w: 260, tone: "remote", no: "00",
-      title: "out / LSE 可合并结果", sub: "实数运算下可交换、可结合",
-      chapter: "attnslice",
-      detail: "两份局部结果可用固定公式合并。实数运算下，该操作满足交换律和结合律，空结果还是单位元；浮点实现可能因顺序不同出现微小舍入差异。"
+      detail: "AttnSlice（注意力切片）把任意 mask 拆成 (QRange, KRange, MaskType) 清单，切片内只保留 FULL、CAUSAL、INV-CAUSAL、BI-CAUSAL 四种几何。局部 out 与 LSE（对数归一项）可按固定公式合并，让 kernel 块间归约和跨 rank 汇合共享同一结果契约；不同浮点顺序可能带来微小舍入差异。"
     },
 
     /* L1 · 硬件基座 */
     {
-      id: "tmem", x: 120, y: 164, w: 220, tone: "dispatch", no: "01",
-      title: "TMEM 常驻累加", sub: "S / P / O 不占寄存器堆",
+      id: "blackwell", x: 420, y: 164, w: 260, tone: "dispatch", no: "01",
+      title: "Blackwell 基座", sub: "TMEM 常驻 · 双引擎异步",
       chapter: "blackwell",
-      detail: "Blackwell 的 Tensor Memory 专门保存矩阵乘累加结果。S、P、O 通过 T2R/R2T 在 TMEM 与寄存器之间搬运，从而减少矩阵乘对普通寄存器的占用。"
-    },
-    {
-      id: "engines", x: 370, y: 164, w: 250, tone: "dispatch", no: "01",
-      title: "TMA / UMMA 异步引擎", sub: "单线程发射 · 硬件记账",
-      chapter: "blackwell",
-      detail: "TMA 负责数据搬运，tcgen05 UMMA 负责矩阵乘。warp 发出异步指令后，通过 mbarrier 得知数据或计算何时完成。"
+      detail: "TMEM（Tensor Memory）专门承载矩阵乘累加结果，S、P、O 通过 T2R/R2T 与寄存器交换，减少对普通寄存器的占用。TMA 负责搬运，tcgen05 UMMA 负责矩阵乘；warp 异步发射后，由 mbarrier（硬件屏障）报告完成。"
     },
 
     /* L2 · kernel 执行 */
     {
-      id: "mask", x: 40, y: 282, w: 210, tone: "compute", no: "03",
-      title: "三层 Mask 防线", sub: "跳块 → 三段循环 → R2P",
+      id: "mask", x: 40, y: 282, w: 230, tone: "compute", no: "03",
+      title: "三层 Mask 防线", sub: "跳块 · 快路 · 边界修正",
       chapter: "mask",
-      detail: "BlockInfo 先跳过全无效块；主循环让全有效块直接走快路径；只有边界穿过的 partial 块才用 R2P 把无效分数写成 -inf。"
+      detail: "BlockInfo（块元数据）先跳过全无效块，主循环让全有效块直接走快路径。只有边界穿过的 partial 块才使用 R2P，把无效分数写成 -inf。"
     },
     {
-      id: "pipe", x: 290, y: 282, w: 230, tone: "communication", no: "02",
-      title: "Warp 特化 · 六流水线", sub: "槽位状态是唯一协调语言",
+      id: "pipe", x: 310, y: 282, w: 230, tone: "communication", no: "02",
+      title: "Warp 特化流水线", sub: "角色分工 · 槽位状态协调",
       chapter: "pipeline",
-      detail: "16 个 warp 按角色分派（load/MMA/softmax/correction/epilogue），六条 mbarrier 流水线管理槽位的满/空。warp 之间不传数据，只翻转状态——数据永远躺在约定好的 TMEM/SMEM 里。"
+      detail: "16 个 warp 按 load、MMA、softmax、correction、epilogue 分工，六条 mbarrier 流水线管理槽位的满与空。warp 之间只翻转状态，不搬运数据；数据始终留在约定的 TMEM 或 SMEM（共享内存）中。"
     },
     {
-      id: "softmax", x: 560, y: 282, w: 220, tone: "compute", no: "04",
-      title: "Online Softmax", sub: "驻留 TMEM · exp2 双管线",
+      id: "softmax", x: 580, y: 282, w: 230, tone: "compute", no: "04",
+      title: "在线 Softmax", sub: "TMEM 驻留 · 递推早放行",
       chapter: "softmax",
-      detail: "以 2 为底换底后内层只剩 packed FMA 与 ex2；row_max 更新即早发布 corr_scale，P 写到 3/4 提前放行 PV GEMM——递推的每一步都在为并行让路。"
+      detail: "Softmax 换为以 2 为底后，内层只剩 packed FMA（融合乘加）与 ex2。row_max 更新后立即发布 corr_scale（校正缩放），P 写到 3/4 就提前放行 PV GEMM，让递推与矩阵乘重叠。"
     },
     {
-      id: "corr", x: 820, y: 282, w: 240, tone: "remote", no: "05",
-      title: "Correction 收口", sub: "块间归约 · 写出 (out, lse)",
+      id: "corr", x: 850, y: 282, w: 210, tone: "remote", no: "05",
+      title: "Correction", sub: "块间校正 · 写出 out/LSE",
       chapter: "correction",
-      detail: "主循环用 corr_scale 把旧 O 换到新的最大值基准，尾声再除以行和 ℓ，并写出 fp32 LSE。块间结果与 rank 间结果使用同一合并公式。"
+      detail: "主循环用 corr_scale 把旧 O 校正到新的最大值基准，尾声再除以行和 ℓ，并写出 fp32 out/LSE。块间与 rank 间沿用同一合并公式，Correction 因而成为 kernel 到分布式归约的收口。"
     },
 
     /* L3 · 调度与反向 */
     {
-      id: "sched", x: 90, y: 400, w: 230, tone: "dispatch", no: "06",
-      title: "LPT · L2 swizzle · CLC", sub: "顺序 × 亲和 × 分配",
+      id: "sched", x: 180, y: 400, w: 260, tone: "dispatch", no: "06",
+      title: "持久化 Tile 调度", sub: "LPT · L2 亲和 · CLC 分配",
       chapter: "scheduler",
-      detail: "causal 负载沿 Q tile 线性递增：LPT 反转派发让重块先行；L2 swizzle 让时间相邻的 CTA 共享 head 的 K/V；CLC 把分配权交还硬件。三个正交自由度各司其职。"
+      detail: "Causal 负载沿 Q tile 线性递增：LPT（最长任务优先）让重块先行，L2 swizzle 保持同一 head 的 K/V 亲和，CLC 把分配交回硬件。Persistent kernel（持久化内核）让每个 CTA 连续消费多个 tile；CTA 数量可调，才可用 sm_margin 给通信让出 SM。"
     },
     {
-      id: "persist", x: 370, y: 400, w: 230, tone: "dispatch", no: "06",
-      title: "Persistent Kernel", sub: "CTA 常驻 · tile 软件派发",
-      chapter: "scheduler",
-      detail: "每个 CTA 连续处理多个 work tile，CTA 总数接近 SM 数。因为启动数量可调，sm_margin 才能让 FFA 少开若干 CTA，为通信 kernel 留出 SM。"
-    },
-    {
-      id: "bwd", x: 650, y: 400, w: 250, tone: "compute", no: "07",
-      title: "反向 5-GEMM", sub: "以 K 为家 · dQ 原子归约",
+      id: "bwd", x: 650, y: 400, w: 260, tone: "compute", no: "07",
+      title: "反向 5-GEMM", sub: "K 为家 · dQ 原子归约",
       chapter: "backward",
-      detail: "固定 K/V 扫过所有 Q：dK/dV 本地累加，dQ 用 TMA bulk atomic-add 全局记账；P 不存不传，用 LSE 重算。分布式反向还要把 dK/dV 送回 KV 属主——这笔通信交给 GroupReduce。"
+      detail: "固定 K/V 扫过所有 Q：dK/dV 本地累加，dQ 用 TMA bulk atomic-add（批量原子加）全局记账。P 不保存也不传输，而由 LSE 重算；分布式反向还需把 dK/dV 送回 KV 属主。"
     },
 
     /* L4 · 分布式 */
     {
-      id: "margin", x: 60, y: 518, w: 240, tone: "orange", no: "08",
-      title: "sm_margin / KernelBarrier", sub: "给通信 kernel 让出 SM",
+      id: "overlap", x: 420, y: 518, w: 260, tone: "communication", no: "08",
+      title: "通算融合", sub: "让出 SM · 分阶段重叠",
       chapter: "overlap",
-      detail: "异步入队不代表同时运行：通信 kernel 也需要 SM。NCCL 路径用 sm_margin 留资源；native grpcoll 使用常驻通信 SM，并以 KernelBarrier 协调发射顺序。"
-    },
-    {
-      id: "overlap", x: 350, y: 518, w: 250, tone: "communication", no: "08",
-      title: "多阶段 Overlap 流水线", sub: "prefetch ∥ compute ∥ reduce",
-      chapter: "overlap",
-      detail: "远端 KV 按成本模型切成 d 个 stage。理想情况下，每一拍同时预取第 i+1 段、计算第 i 段、处理第 i−1 段结果。实际收益还取决于队列和 SM 资源。"
-    },
-    {
-      id: "grpcoll", x: 650, y: 518, w: 260, tone: "communication", no: "08",
-      title: "GroupCast / GroupReduce", sub: "按依赖清单精确投递",
-      chapter: "overlap",
-      detail: "GroupCast 按依赖清单把一段数据发给多个 rank；GroupReduce 把多个来源的对应段送回属主并合并。reduce_op=\"lse\" 使用 out/LSE 合并公式。"
+      detail: "异步入队不等于同时运行：NCCL 路径用 sm_margin 留出 SM，native grpcoll 以常驻通信 SM 配合 KernelBarrier 协调发射。GroupCast/GroupReduce（组播/组归约）按依赖清单精确投递，并用 out/LSE 公式合并结果。远端 KV 再按成本模型切成多个 stage，使预取、计算与归约形成重叠；收益仍取决于队列和 SM 资源。"
     }
   ];
 
   var EDGES = [
-    { from: "rep", to: "semi", d: "M390 75H660", label: "切片可重叠、跨 rank ⇒ 输出必须可合并" },
-    { from: "rep", to: "mask", d: "M155 104V140H90V282", label: "四种几何的列界都是行号的线性函数" },
-    { from: "semi", to: "corr", d: "M900 104V140H1010V282", label: "kernel 内块间结果使用同一合并公式" },
-    { from: "semi", to: "grpcoll", d: "M900 104V126H1080V498H850V518", label: "reduce_op=\"lse\" 直接实现合并公式" },
-    { from: "tmem", to: "softmax", d: "M230 222V252H620V282", label: "S/P 常驻片上 · T2R/R2T 免搬运" },
-    { from: "engines", to: "pipe", d: "M450 222V282", label: "异步引擎需要 warp 特化来驾驶" },
-    { from: "pipe", to: "softmax", d: "M520 311H560", label: "S-full / P-release 槽位协议供数" },
-    { from: "pipe", to: "corr", d: "M470 282V262H900V282", label: "sScale 握手 · cross-release 错峰" },
-    { from: "mask", to: "sched", d: "M160 340V400", label: "causal 负载线性递增 ⇒ LPT 反转派发" },
-    { from: "corr", to: "grpcoll", d: "M930 340V486H880V518", label: "(out, lse) 是 GroupReduce 的载荷" },
-    { from: "sched", to: "persist", d: "M320 429H370", label: "同一个 while work_tile 消费骨架" },
-    { from: "persist", to: "margin", d: "M420 458V488H240V518", label: "CTA 数可调 ⇒ 少开即让出 SM" },
-    { from: "margin", to: "overlap", d: "M300 547H350", label: "通信获得 SM，预取才可能并行" },
-    { from: "grpcoll", to: "overlap", d: "M650 547H600", label: "按清单投递的原语是流水线的积木" },
-    { from: "bwd", to: "overlap", d: "M700 458V492H520V518", label: "反向 dKV 归约同样进 overlap 环" }
+    { from: "attnslice", to: "mask", d: "M470 104V136H155V282", label: "切片几何限定 Mask" },
+    { from: "attnslice", to: "corr", d: "M630 104V136H955V282", label: "可合并约定要求收口" },
+    { from: "attnslice", to: "overlap", d: "M420 75H20V547H420", label: "切片清单限定通信" },
+    { from: "blackwell", to: "pipe", d: "M425 222V282", label: "异步引擎需角色驾驶" },
+    { from: "pipe", to: "softmax", d: "M540 311H580", label: "槽位协议供数" },
+    { from: "pipe", to: "corr", d: "M470 282V262H900V282", label: "缩放握手驱动校正" },
+    { from: "mask", to: "sched", d: "M155 340V370H255V400", label: "负载差异需要 LPT" },
+    { from: "softmax", to: "corr", d: "M810 311H850", label: "递推结果归约收口" },
+    { from: "softmax", to: "bwd", d: "M695 340V400", label: "LSE 支撑反向重算" },
+    { from: "corr", to: "overlap", d: "M955 340V478H660V518", label: "可合并结果进入归约" },
+    { from: "sched", to: "overlap", d: "M310 458V498H540V518", label: "CTA 可调才能让出 SM" },
+    { from: "bwd", to: "overlap", d: "M780 458V488H600V518", label: "dK/dV 需送回属主" }
   ];
 
   var CHAPTER_NAMES = {
@@ -225,8 +192,7 @@
       ["compute", "计算路径"],
       ["dispatch", "硬件 / 调度"],
       ["communication", "流水线 / 通信"],
-      ["remote", "归约 / 收口"],
-      ["orange", "资源分配"]
+      ["remote", "归约 / 收口"]
     ];
     var lx = 60;
     legend.forEach(function (item) {
@@ -248,10 +214,10 @@
     if (!node) {
       panel.innerHTML =
         '<span class="lineage-detail__label">Optimization Lineage · 怎么读</span>' +
-        "<h3>点击任意优化点</h3>" +
-        "<p>左图是整门课的因果骨架：每个节点是一个优化点，每条箭头读作「因为有了 A，B 才成立 / 才必要」。</p>" +
-        "<p>悬停可以预览一个优化点的完整上下游链条；点击固定后，这里会展开它的解读、依赖关系与所属章节入口。</p>" +
-        '<p class="lineage-detail__tip">推荐路线：从 <strong>AttnSlice 切片表示</strong> 出发走到 <strong>多阶段 Overlap 流水线</strong>，正好穿过全部 9 章。</p>';
+        "<h3>先看因果，再进章节</h3>" +
+        "<p>每个节点对应一章；每条箭头都读作「因为有 A，B 才成立或才有必要」。</p>" +
+        "<p>悬停节点可预览完整上下游；点击后固定依赖链，并在这里查看解读与章节入口。</p>" +
+        '<p class="lineage-detail__tip">首次阅读按章节顺序：从 <strong>AttnSlice 契约</strong> 一路走到 <strong>通算融合</strong>，正好穿过全部 9 章。</p>';
       return;
     }
     var ups = upOf[node.id].map(function (edge) {

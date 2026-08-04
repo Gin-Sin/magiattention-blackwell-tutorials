@@ -174,17 +174,9 @@
           <div>
             <h2>一张可交互的优化脉络图</h2>
             <p>
-              每一章都是一个优化点，且只依赖它之前的章节：
-              先建立 <strong>AttnSlice = (QRange, KRange, MaskType)</strong> 的语义契约与
-              <strong>out/lse 可累加</strong>的输出约定；再认识 Blackwell 的
-              <strong>TMEM + tcgen05 UMMA + TMA</strong> 执行基座；然后进入 kernel 本体——
-              <strong>warp 特化流水线</strong>、<strong>块级 mask</strong>、
-              <strong>online softmax</strong>、<strong>correction 归约</strong>、
-              <strong>persistent/CLC 调度</strong>与<strong>反向 kernel</strong>；
-              最终所有优化点在<strong>通算融合</strong>处汇流——kernel 的可合并输出、
-              persistent 的 SM 让渡、GroupCast/GroupReduce 原语共同撑起分布式 CP。
-              下图把这些因果依赖画成一张图：<strong>悬停</strong>预览一个优化点的上下游链条，
-              <strong>点击</strong>固定并阅读解读。
+              这张图将 9 章串成因果主线：从切片契约与硬件基座出发，经流水线、Mask、Softmax、
+              Correction、调度和反向，最终汇入通算融合。箭头表示前者让后者成立或变得必要；
+              <strong>悬停</strong>预览上下游，<strong>点击</strong>固定并查看解读。
             </p>
           </div>
         </header>
