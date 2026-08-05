@@ -100,9 +100,24 @@
   font: italic 500 15px/1 var(--display);
 }
 .report-figure--aux { margin: 22px 0 8px; }
-.report-figure--aux .diagram-canvas { border: 1px solid var(--rule); border-radius: 14px; overflow: hidden; }
+.report-figure--aux .diagram-canvas {
+  border: 1px solid var(--rule);
+  border-radius: 14px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-inline: contain;
+}
 .report-figure--aux .figcaption { margin: 10px 2px 0; font-size: 12.5px; color: var(--muted); }
 .explain-section .formula { margin-top: 18px; }
+
+/* Over-wide KaTeX display math (cards, exercises, formulas) scrolls sideways
+   instead of overflowing the viewport on narrow screens. */
+.katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 2px 1px;
+  overscroll-behavior-inline: contain;
+}
 
 /* Info cards: highlight recipes, source facts and numeric examples in prose. */
 .info-card {
@@ -168,9 +183,11 @@
 .explain-section p code,
 .chapter-main p code,
 .exercise-body code,
+.info-card code,
 .takeaway code {
   font-family: var(--mono);
   font-size: .86em;
+  overflow-wrap: anywhere;
   background: var(--paper-3);
   border: 1px solid var(--rule);
   border-radius: 5px;
